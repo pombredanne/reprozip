@@ -1,6 +1,6 @@
 # This is paramiko/demos/interactive.py
 # Part of the Paramiko project; https://github.com/paramiko/paramiko/
-# Adapted by Remi Rampin
+# Adapted by Remi Rampin, New York University for ReproZip, 2015
 
 # Copyright (C) 2003-2007  Robey Pointer <robeypointer@gmail.com>
 #
@@ -21,10 +21,11 @@
 # 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA.
 
 
-from __future__ import unicode_literals
+from __future__ import division, print_function, unicode_literals
 
 import socket
-import sys
+
+from reprounzip.utils import stdout, stdout_bytes, stderr_bytes, stdin_bytes
 
 # windows does not have termios...
 try:
@@ -43,51 +44,52 @@ def interactive_shell(chan, raw=True):
 
 
 def posix_shell(chan, raw):
+    # set signal somehow
     import select
 
-    oldtty = termios.tcgetattr(sys.stdin)
+    oldtty = termios.tcgetattr(stdin_bytes)
     try:
         if raw:
-            tty.setraw(sys.stdin.fileno())
-            tty.setcbreak(sys.stdin.fileno())
+            tty.setraw(stdin_bytes.fileno())
+            tty.setcbreak(stdin_bytes.fileno())
         chan.settimeout(0.0)
 
         while True:
-            r, w, e = select.select([chan, sys.stdin], [], [])
+            r, w, e = select.select([chan, stdin_bytes], [], [])
             if chan in r:
                 try:
                     if chan.recv_stderr_ready():
                         x = chan.recv_stderr(1024)
                         if len(x) > 0:
-                            sys.stderr.buffer.write(x)
-                            sys.stderr.flush()
+                            stderr_bytes.write(x)
+                            stderr_bytes.flush()
                     else:
                         x = chan.recv(1024)
                         if len(x) == 0:
                             break
-                        sys.stdout.buffer.write(x)
-                        sys.stdout.flush()
+                        stdout_bytes.write(x)
+                        stdout_bytes.flush()
                 except socket.timeout:
                     pass
-            if sys.stdin in r:
-                x = sys.stdin.read(1)
+            if stdin_bytes in r:
+                x = stdin_bytes.read(1)
                 if len(x) == 0:
                     break
                 chan.send(x)
 
     finally:
         if raw:
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, oldtty)
+            termios.tcsetattr(stdin_bytes, termios.TCSADRAIN, oldtty)
 
 
 # thanks to Mike Looijmans for this code
 def windows_shell(chan):
+    # set signal somehow
     import threading
 
-    sys.stdout.write("*** Emulating terminal on Windows; press F6 or Ctrl+Z "
-                     "then enter to send EOF,\r\nor at the end of the "
-                     "execution.\r\n")
-    sys.stdout.flush()
+    stdout.write("*** Emulating terminal on Windows; press F6 or Ctrl+Z then "
+                 "enter to send EOF,\r\nor at the end of the execution.\r\n")
+    stdout.flush()
 
     out_lock = threading.RLock()
 
@@ -97,14 +99,14 @@ def windows_shell(chan):
             if not data:
                 if std:
                     with out_lock:
-                        sys.stdout.write(
-                                "\r\n*** EOF reached; (press F6 or ^Z then "
-                                "enter to end)\r\n")
-                        sys.stdout.flush()
+                        stdout.write(
+                            "\r\n*** EOF reached; (press F6 or ^Z then enter "
+                            "to end)\r\n")
+                        stdout.flush()
                 break
-            stream = [sys.stderr, sys.stdout][std]
+            stream = [stderr_bytes, stdout_bytes][std]
             with out_lock:
-                stream.buffer.write(data)
+                stream.write(data)
                 stream.flush()
 
     threading.Thread(target=write, args=(chan.recv, True)).start()
@@ -112,7 +114,7 @@ def windows_shell(chan):
 
     try:
         while True:
-            d = sys.stdin.read(1)
+            d = stdin_bytes.read(1)
             if not d:
                 chan.shutdown_write()
                 break

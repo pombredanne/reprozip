@@ -1,4 +1,4 @@
-# Copyright (C) 2014 New York University
+# Copyright (C) 2014-2016 New York University
 # This file is part of ReproZip which is released under the Revised BSD License
 # See file LICENSE for full license details.
 
@@ -13,43 +13,118 @@ to this software (more utilities).
 
 """
 
-from __future__ import unicode_literals
+from __future__ import division, print_function, unicode_literals
 
+import codecs
 import contextlib
 import email.utils
+import itertools
+import locale
 import logging
+import operator
 import os
-from rpaths import Path
+import requests
+from rpaths import Path, PosixPath
 import stat
 import subprocess
 import sys
+
+
+class StreamWriter(object):
+    def __init__(self, stream):
+        writer = codecs.getwriter(locale.getpreferredencoding())
+        self._writer = writer(stream, 'replace')
+        self.buffer = stream
+
+    def writelines(self, lines):
+        self.write(str('').join(lines))
+
+    def write(self, obj):
+        if isinstance(obj, bytes):
+            self.buffer.write(obj)
+        else:
+            self._writer.write(obj)
+
+    def __getattr__(self, name,
+                    getattr=getattr):
+
+        """ Inherit all other methods from the underlying stream.
+        """
+        return getattr(self._writer, name)
 
 
 PY3 = sys.version_info[0] == 3
 
 
 if PY3:
-    from urllib.error import HTTPError, URLError
-    from urllib.request import Request, urlopen
     izip = zip
     irange = range
     iteritems = dict.items
     itervalues = dict.values
     listvalues = lambda d: list(d.values())
+
+    stdout_bytes, stderr_bytes = sys.stdout.buffer, sys.stderr.buffer
+    stdin_bytes = sys.stdin.buffer
+    stdout, stderr = sys.stdout, sys.stderr
 else:
-    from urllib2 import Request, HTTPError, URLError, urlopen
-    import itertools
     izip = itertools.izip
     irange = xrange
     iteritems = dict.iteritems
     itervalues = dict.itervalues
     listvalues = dict.values
 
+    _writer = codecs.getwriter(locale.getpreferredencoding())
+    stdout_bytes, stderr_bytes = sys.stdout, sys.stderr
+    stdin_bytes = sys.stdin
+    stdout, stderr = StreamWriter(sys.stdout), StreamWriter(sys.stderr)
+
 
 if PY3:
+    int_types = int,
     unicode_ = str
 else:
+    int_types = int, long
     unicode_ = unicode
+
+
+def flatten(n, l):
+    """Flattens an iterable by repeatedly calling chain.from_iterable() on it.
+
+    >>> a = [[1, 2, 3], [4, 5, 6]]
+    >>> b = [[7, 8], [9, 10, 11, 12, 13, 14, 15, 16]]
+    >>> l = [a, b]
+    >>> list(flatten(0, a))
+    [[1, 2, 3], [4, 5, 6]]
+    >>> list(flatten(1, a))
+    [1, 2, 3, 4, 5, 6]
+    >>> list(flatten(1, l))
+    [[1, 2, 3], [4, 5, 6], [7, 8], [9, 10, 11, 12, 13, 14, 15, 16]]
+    >>> list(flatten(2, l))
+    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    """
+    for _ in irange(n):
+        l = itertools.chain.from_iterable(l)
+    return l
+
+
+class UniqueNames(object):
+    """Makes names unique amongst the ones it's already seen.
+    """
+    def __init__(self):
+        self.names = set()
+
+    def insert(self, name):
+        assert name not in self.names
+        self.names.add(name)
+
+    def __call__(self, name):
+        nb = 1
+        attempt = name
+        while attempt in self.names:
+            nb += 1
+            attempt = '%s_%d' % (name, nb)
+        self.names.add(attempt)
+        return attempt
 
 
 def escape(s):
@@ -69,6 +144,68 @@ class CommonEqualityMixin(object):
 
     def __ne__(self, other):
         return not self.__eq__(other)
+
+
+def optional_return_type(req_args, other_args):
+    """Sort of namedtuple but with name-only fields.
+
+    When deconstructing a namedtuple, you have to get all the fields:
+
+    >>> o = namedtuple('T', ['a', 'b', 'c'])(1, 2, 3)
+    >>> a, b = o
+    ValueError: too many values to unpack
+
+    You thus cannot easily add new return values. This class allows it:
+
+    >>> o2 = optional_return_type(['a', 'b'], ['c'])(1, 2, 3)
+    >>> a, b = o2
+    >>> c = o2.c
+    """
+    if len(set(req_args) | set(other_args)) != len(req_args) + len(other_args):
+        raise ValueError
+
+    # Maps argument name to position in each list
+    req_args_pos = dict((n, i) for i, n in enumerate(req_args))
+    other_args_pos = dict((n, i) for i, n in enumerate(other_args))
+
+    def cstr(cls, *args, **kwargs):
+        if len(args) > len(req_args) + len(other_args):
+            raise TypeError(
+                "Too many arguments (expected at least %d and no more than "
+                "%d)" % (len(req_args),
+                         len(req_args) + len(other_args)))
+
+        args1, args2 = args[:len(req_args)], args[len(req_args):]
+        req = dict((i, v) for i, v in enumerate(args1))
+        other = dict(izip(other_args, args2))
+
+        for k, v in iteritems(kwargs):
+            if k in req_args_pos:
+                pos = req_args_pos[k]
+                if pos in req:
+                    raise TypeError("Multiple values for field %s" % k)
+                req[pos] = v
+            elif k in other_args_pos:
+                if k in other:
+                    raise TypeError("Multiple values for field %s" % k)
+                other[k] = v
+            else:
+                raise TypeError("Unknown field name %s" % k)
+
+        args = []
+        for i, k in enumerate(req_args):
+            if i not in req:
+                raise TypeError("Missing value for field %s" % k)
+            args.append(req[i])
+
+        inst = tuple.__new__(cls, args)
+        inst.__dict__.update(other)
+        return inst
+
+    dct = {'__new__': cstr}
+    for i, n in enumerate(req_args):
+        dct[n] = property(operator.itemgetter(i))
+    return type(str('OptionalReturnType'), (tuple,), dct)
 
 
 def hsize(nbytes):
@@ -97,6 +234,17 @@ def hsize(nbytes):
         return "{0:.2f} TB".format(nbytes / TB)
     else:
         return "{0:.2f} PB".format(nbytes / PB)
+
+
+def normalize_path(path):
+    """Normalize a path obtained from the database.
+    """
+    # For some reason, os.path.normpath() keeps multiple leading slashes
+    # We don't want this since it has no meaning on Linux
+    path = PosixPath(path)
+    if path.path.startswith(path._sep + path._sep):
+        path = PosixPath(path.path[1:])
+    return path
 
 
 def find_all_links_recursive(filename, files):
@@ -149,6 +297,14 @@ def find_all_links(filename, include_target=False):
     if include_target:
         files.append(path)
     return files
+
+
+def join_root(root, path):
+    """Prepends `root` to the absolute path `path`.
+    """
+    p_root, p_loc = path.split_root()
+    assert p_root == b'/'
+    return root / p_loc
 
 
 @contextlib.contextmanager
@@ -221,23 +377,22 @@ def rmtree_fixed(path):
     path.rmdir()
 
 
-def check_output(*popenargs, **kwargs):
-    """Runs a command and returns its output, raising on non-zero exit code.
+# Compatibility with ReproZip <= 1.0.3
+check_output = subprocess.check_output
+
+
+def copyfile(source, destination, CHUNK_SIZE=4096):
+    """Copies from one file object to another.
     """
-    if 'stdout' in kwargs:
-        raise ValueError("stdout argument not allowed")
-    process = subprocess.Popen(stdout=subprocess.PIPE, *popenargs, **kwargs)
-    stdout, stderr = process.communicate()
-    retcode = process.poll()
-    if retcode:
-        cmd = kwargs.get('args')
-        if cmd is None:
-            cmd = [popenargs[0]]
-        raise subprocess.CalledProcessError(retcode, cmd)
-    return stdout
+    while True:
+        chunk = source.read(CHUNK_SIZE)
+        if chunk:
+            destination.write(chunk)
+        if len(chunk) != CHUNK_SIZE:
+            break
 
 
-def download_file(url, dest, cachename=None):
+def download_file(url, dest, cachename=None, ssl_verify=None):
     """Downloads a file using a local cache.
 
     If the file cannot be downloaded or if it wasn't modified, the cached
@@ -246,9 +401,11 @@ def download_file(url, dest, cachename=None):
     The cache lives in ``~/.cache/reprozip/``.
     """
     if cachename is None:
-        cachename = dest.name
+        if dest is None:
+            raise ValueError("One of 'dest' or 'cachename' must be specified")
+        cachename = dest.components[-1]
 
-    request = Request(url)
+    headers = {}
 
     if 'XDG_CACHE_HOME' in os.environ:
         cache = Path(os.environ['XDG_CACHE_HOME'])
@@ -257,36 +414,38 @@ def download_file(url, dest, cachename=None):
     cache = cache / 'reprozip' / cachename
     if cache.exists():
         mtime = email.utils.formatdate(cache.mtime(), usegmt=True)
-        request.add_header('If-Modified-Since', mtime)
+        headers['If-Modified-Since'] = mtime
 
     cache.parent.mkdir(parents=True)
 
     try:
-        response = urlopen(request)
-    except URLError as e:
+        response = requests.get(url, headers=headers,
+                                timeout=2 if cache.exists() else 10,
+                                stream=True, verify=ssl_verify)
+        response.raise_for_status()
+        if response.status_code == 304:
+            raise requests.HTTPError(
+                '304 File is up to date, no data returned',
+                response=response)
+    except requests.RequestException as e:
         if cache.exists():
-            if isinstance(e, HTTPError) and e.code == 304:
-                logging.info("Cached file %s is up to date", cachename)
+            if e.response and e.response.status_code == 304:
+                logging.info("Download %s: cache is up to date", cachename)
             else:
-                logging.warning("Couldn't download %s: %s", url, e)
-            cache.copy(dest)
-            return
+                logging.warning("Download %s: error downloading %s: %s",
+                                cachename, url, e)
+            if dest is not None:
+                cache.copy(dest)
+                return dest
+            else:
+                return cache
         else:
             raise
 
-    if response is None:
-        logging.info("Cached file %s is up to date", cachename)
-        cache.copy(dest)
-        return
-
-    logging.info("Downloading %s", url)
+    logging.info("Download %s: downloading %s", cachename, url)
     try:
-        CHUNK_SIZE = 4096
         with cache.open('wb') as f:
-            while True:
-                chunk = response.read(CHUNK_SIZE)
-                if not chunk:
-                    break
+            for chunk in response.iter_content(4096):
                 f.write(chunk)
         response.close()
     except Exception as e:  # pragma: no cover
@@ -295,5 +454,10 @@ def download_file(url, dest, cachename=None):
         except OSError:
             pass
         raise e
+    logging.info("Downloaded %s successfully", cachename)
 
-    cache.copy(dest)
+    if dest is not None:
+        cache.copy(dest)
+        return dest
+    else:
+        return cache

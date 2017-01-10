@@ -1,4 +1,4 @@
-# Copyright (C) 2014 New York University
+# Copyright (C) 2014-2016 New York University
 # This file is part of ReproZip which is released under the Revised BSD License
 # See file LICENSE for full license details.
 
@@ -11,10 +11,13 @@ It dispatchs to plugins registered through pkg_resources as entry point
 ``reprounzip.unpackers``.
 """
 
-from __future__ import absolute_import, print_function, unicode_literals
+from __future__ import division, print_function, unicode_literals
+
+if __name__ == '__main__':  # noqa
+    from reprounzip.main import main
+    main()
 
 import argparse
-import codecs
 import locale
 import logging
 from pkg_resources import iter_entry_points
@@ -28,7 +31,7 @@ from reprounzip import signals
 from reprounzip.unpackers.common import UsageError
 
 
-__version__ = '0.5.1'
+__version__ = '1.1.0'
 
 
 unpackers = {}
@@ -75,43 +78,33 @@ def main():
     # Locale
     locale.setlocale(locale.LC_ALL, '')
 
-    # Encoding for output streams
-    if str == bytes:  # PY2
-        writer = codecs.getwriter(locale.getpreferredencoding())
-        o_stdout, o_stderr = sys.stdout, sys.stderr
-        sys.stdout = writer(sys.stdout)
-        sys.stdout.buffer = o_stdout
-        sys.stderr = writer(sys.stderr)
-        sys.stderr.buffer = o_stderr
-    else:
-        sys.stdin = sys.stdin.buffer
-
     # Parses command-line
 
     # General options
-    options = argparse.ArgumentParser(add_help=False)
-    options.add_argument('--version', action='version',
-                         version="reprounzip version %s" % __version__)
-    options.add_argument('-v', '--verbose', action='count', default=1,
-                         dest='verbosity',
-                         help="augments verbosity level")
+    def add_options(opts):
+        opts.add_argument('--version', action='version',
+                          version="reprounzip version %s" % __version__)
 
     # Loads plugins
     for name, func, descr, descr_1 in get_plugins('reprounzip.plugins'):
         func()
 
     parser = RPUZArgumentParser(
-            description="reprounzip is the ReproZip component responsible for "
-                        "unpacking and reproducing an experiment previously "
-                        "packed with reprozip",
-            epilog="Please report issues to reprozip-users@vgc.poly.edu",
-            parents=[options])
+        description="reprounzip is the ReproZip component responsible for "
+                    "unpacking and reproducing an experiment previously "
+                    "packed with reprozip",
+        epilog="Please report issues to reprozip-users@vgc.poly.edu")
+    add_options(parser)
+    parser.add_argument('-v', '--verbose', action='count', default=1,
+                        dest='verbosity',
+                        help="augments verbosity level")
     subparsers = parser.add_subparsers(title="subcommands", metavar='')
 
     # usage_report subcommand
     parser_stats = subparsers.add_parser(
-            'usage_report', parents=[options],
-            help="Enables or disables anonymous usage reports")
+        'usage_report',
+        help="Enables or disables anonymous usage reports")
+    add_options(parser_stats)
     parser_stats.add_argument('--enable', action='store_true')
     parser_stats.add_argument('--disable', action='store_true')
     parser_stats.set_defaults(func=usage_report)
@@ -119,9 +112,9 @@ def main():
     # Loads unpackers
     for name, func, descr, descr_1 in get_plugins('reprounzip.unpackers'):
         plugin_parser = subparsers.add_parser(
-                name, parents=[options],
-                help=descr_1, description=descr,
-                formatter_class=argparse.RawDescriptionHelpFormatter)
+            name, help=descr_1, description=descr,
+            formatter_class=argparse.RawDescriptionHelpFormatter)
+        add_options(plugin_parser)
         info = func(plugin_parser)
         plugin_parser.set_defaults(selected_unpacker=name)
         if info is None:
@@ -131,10 +124,10 @@ def main():
     signals.pre_parse_args(parser=parser, subparsers=subparsers)
     args = parser.parse_args()
     signals.post_parse_args(args=args)
-    try:
-        signals.unpacker = args.selected_unpacker
-    except AttributeError:
-        signals.unpacker = None
+    if getattr(args, 'func', None) is None:
+        parser.print_help(sys.stderr)
+        sys.exit(2)
+    signals.unpacker = getattr(args, 'selected_unpacker', None)
     setup_logging('REPROUNZIP', args.verbosity)
 
     setup_usage_report('reprounzip', __version__)
@@ -156,10 +149,6 @@ def main():
             signals.application_finishing(reason=None)
     except UsageError:
         parser.print_help(sys.stderr)
-        sys.exit(1)
+        sys.exit(2)
     submit_usage_report(result='success')
     sys.exit(0)
-
-
-if __name__ == '__main__':
-    main()

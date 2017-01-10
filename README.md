@@ -1,11 +1,15 @@
 [![Build Status](https://travis-ci.org/ViDA-NYU/reprozip.svg?branch=master)]
 (https://travis-ci.org/ViDA-NYU/reprozip)
 [![Coverage Status]
-(https://coveralls.io/repos/ViDA-NYU/reprozip/badge.png?branch=master)]
-(https://coveralls.io/r/ViDA-NYU/reprozip?branch=master)
+(https://codecov.io/github/ViDA-NYU/reprozip/coverage.svg?branch=master)]
+(https://codecov.io/github/ViDA-NYU/reprozip?branch=master)
 [![Code Health](https://landscape.io/github/ViDA-NYU/reprozip/master/landscape.png)](https://landscape.io/github/ViDA-NYU/reprozip/master)
-[![Documentation Status](https://readthedocs.org/projects/reprozip/badge/)]
-(http://reprozip.readthedocs.org/en/latest/)
+[![Documentation Status](https://readthedocs.org/projects/reprozip/badge/?version=latest)]
+(https://docs.reprozip.org/en/latest/)
+[![Matrix](https://img.shields.io/badge/chat-matrix.org-brightgreen.svg)](https://riot.im/app/#/room/#reprozip:matrix.org)
+[![status](http://joss.theoj.org/papers/b578b171263c73f64dfb9d040ca80fe0/status.svg)]
+(http://joss.theoj.org/papers/b578b171263c73f64dfb9d040ca80fe0)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.60654.svg)](https://doi.org/10.5281/zenodo.60654)
 
 ReproZip
 ========
@@ -21,6 +25,8 @@ the experiment in his environment to reproduce the results (unpacking step).
 
 Quickstart
 ----------
+
+We have an [example repository](https://github.com/ViDA-NYU/reprozip-examples) with a variety of different software. Don't hesitate to check it out, and contribute your own example if use ReproZip for something new!
 
 ### Packing
 
@@ -126,6 +132,36 @@ Then, assuming that you want to create the container under directory
 Remember that you can open the help message and learn more about other
 available flags and options by using the flag *-h* for any reprounzip command.
 
+Contribute
+----------
+
+Please subscribe to and contact the
+[reprozip-users](https://vgc.poly.edu/mailman/listinfo/reprozip-users) mailing
+list for questions, suggestions and discussions about using reprozip.
+
+Use the [reprozip-dev](https://vgc.poly.edu/mailman/listinfo/reprozip-dev)
+mailing list for any questions about reprozip source code.
+
+Bugs and feature plannings are tracked in the
+[GitHub issues](https://github.com/ViDA-NYU/reprozip/issues). Feel free to add
+an issue!
+
+To suggest changes to this source code, feel free to raise a
+[GitHub pull request](https://github.com/ViDA-NYU/reprozip/pulls).
+Any contributions received are assumed to be covered by the
+[BSD 3-Clause license](LICENSE.txt). We might ask you to sign a
+_Contributor License Agreement_ before accepting a larger contribution.
+
+
+License
+-------
+
+* (c) Copyright (c) 2014-2016, New York University
+
+Licensed under a **BSD-3 Clause license**. See the file
+[LICENSE.txt](LICENSE.txt) for details.
+
+
 Links and References
 --------------------
 
@@ -135,20 +171,22 @@ to our [documentation][docs].
 ReproZip is currently being developed at [NYU][nyu]. The team includes:
 
 * [Fernando Chirigati][fc]
+* [Juliana Freire][jf]
 * [Rémi Rampin][rr]
 * [Dennis Shasha][ds]
-* [Juliana Freire][jf]
+* [Vicky Steeves][vs]
 
-[vagrant]: http://www.vagrantup.com/
+[vagrant]: https://www.vagrantup.com/
 [docker]: https://www.docker.com/
-[docs]: http://reprozip.readthedocs.org/
-[web]: http://vida-nyu.github.io/reprozip/
+[docs]: https://docs.reprozip.org/
+[web]: https://www.reprozip.org/
 [pz]: https://pypi.python.org/pypi/reprozip
 [puz]: https://pypi.python.org/pypi/reprounzip
 [puzd]: https://pypi.python.org/pypi/reprounzip-docker
 [puzv]: https://pypi.python.org/pypi/reprounzip-vagrant
-[fc]: http://vgc.poly.edu/~fchirigati/
-[rr]: https://www.linkedin.com/profile/view?id=98448601
-[jf]: http://vgc.poly.edu/~juliana/
+[fc]: https://vgc.poly.edu/~fchirigati/
+[jf]: https://vgc.poly.edu/~juliana/
+[rr]: https://remirampin.com/
 [ds]: http://cs.nyu.edu/shasha/
+[vs]: https://vickysteeves.com/
 [nyu]: http://engineering.nyu.edu/

@@ -7,6 +7,8 @@
 
 #include <sys/ptrace.h>
 #include <sys/reg.h>
+#include <sys/resource.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/user.h>
@@ -16,6 +18,7 @@
 #include "config.h"
 #include "database.h"
 #include "log.h"
+#include "ptrace_utils.h"
 #include "syscalls.h"
 #include "tracer.h"
 #include "utils.h"
@@ -97,6 +100,15 @@ int trace_verbosity = 0;
 #define verbosity trace_verbosity
 
 
+void free_execve_info(struct ExecveInfo *execi)
+{
+    free_strarray(execi->argv);
+    free_strarray(execi->envp);
+    free(execi->binary);
+    free(execi);
+}
+
+
 struct Process **processes = NULL;
 size_t processes_size;
 
@@ -105,7 +117,7 @@ struct Process *trace_find_process(pid_t tid)
     size_t i;
     for(i = 0; i < processes_size; ++i)
     {
-        if(processes[i]->status != PROCESS_FREE && processes[i]->tid == tid)
+        if(processes[i]->status != PROCSTAT_FREE && processes[i]->tid == tid)
             return processes[i];
     }
     return NULL;
@@ -116,25 +128,19 @@ struct Process *trace_get_empty_process(void)
     size_t i;
     for(i = 0; i < processes_size; ++i)
     {
-        if(processes[i]->status == PROCESS_FREE)
+        if(processes[i]->status == PROCSTAT_FREE)
             return processes[i];
     }
 
     /* Count unknown processes */
+    if(verbosity >= 3)
     {
         size_t unknown = 0;
         for(i = 0; i < processes_size; ++i)
-            if(processes[i]->status == PROCESS_UNKNOWN)
+            if(processes[i]->status == PROCSTAT_UNKNOWN)
                 ++unknown;
-        {
-            int many_unknown = unknown * 2 >= processes_size;
-            if(many_unknown && verbosity >= 1)
-                log_warn(0, "there are %u/%u UNKNOWN processes",
-                         (unsigned int)unknown, (unsigned int)processes_size);
-            else if(verbosity >= 2)
-                log_info(0, "there are %u/%u UNKNOWN processes",
-                         (unsigned int)unknown, (unsigned int)processes_size);
-        }
+        log_debug(0, "there are %u/%u UNKNOWN processes",
+                  (unsigned int)unknown, (unsigned int)processes_size);
     }
 
     /* Allocate more! */
@@ -150,9 +156,52 @@ struct Process *trace_get_empty_process(void)
         for(; i < processes_size; ++i)
         {
             processes[i] = pool++;
-            processes[i]->status = PROCESS_FREE;
+            processes[i]->status = PROCSTAT_FREE;
+            processes[i]->threadgroup = NULL;
+            processes[i]->execve_info = NULL;
         }
         return processes[prev_size];
+    }
+}
+
+struct ThreadGroup *trace_new_threadgroup(pid_t tgid, char *wd)
+{
+    struct ThreadGroup *threadgroup = malloc(sizeof(struct ThreadGroup));
+    threadgroup->tgid = tgid;
+    threadgroup->wd = wd;
+    threadgroup->refs = 1;
+    if(verbosity >= 3)
+        log_debug(tgid, "threadgroup (= process) created");
+    return threadgroup;
+}
+
+void trace_free_process(struct Process *process)
+{
+    process->status = PROCSTAT_FREE;
+    if(process->threadgroup != NULL)
+    {
+        process->threadgroup->refs--;
+        if(verbosity >= 3)
+            log_debug(process->tid,
+                      "process died, threadgroup tgid=%d refs=%d",
+                      process->threadgroup->tgid, process->threadgroup->refs);
+        if(process->threadgroup->refs == 0)
+        {
+            if(verbosity >= 3)
+                log_debug(process->threadgroup->tgid,
+                          "deallocating threadgroup");
+            if(process->threadgroup->wd != NULL)
+                free(process->threadgroup->wd);
+            free(process->threadgroup);
+        }
+        process->threadgroup = NULL;
+    }
+    else if(verbosity >= 3)
+        log_debug(process->tid, "threadgroup==NULL");
+    if(process->execve_info != NULL)
+    {
+        free_execve_info(process->execve_info);
+        process->execve_info = NULL;
     }
 }
 
@@ -164,14 +213,14 @@ void trace_count_processes(unsigned int *p_nproc, unsigned int *p_unknown)
     {
         switch(processes[i]->status)
         {
-        case PROCESS_FREE:
+        case PROCSTAT_FREE:
             break;
-        case PROCESS_UNKNOWN:
+        case PROCSTAT_UNKNOWN:
             /* Exists but no corresponding syscall has returned yet */
             ++unknown;
-        case PROCESS_ALLOCATED:
+        case PROCSTAT_ALLOCATED:
             /* Not yet attached but it will show up eventually */
-        case PROCESS_ATTACHED:
+        case PROCSTAT_ATTACHED:
             /* Running */
             ++nproc;
             break;
@@ -209,6 +258,7 @@ int trace_add_files_from_proc(unsigned int process, pid_t tid,
     log_info(tid, "parsing %s", procfile);
 #endif
     fp = fopen(procfile, "r");
+    free(procfile);
 
     while((line = read_line(line, &length, fp)) != NULL)
     {
@@ -260,6 +310,7 @@ int trace_add_files_from_proc(unsigned int process, pid_t tid,
             }
         }
     }
+    fclose(fp);
     return 0;
 }
 
@@ -283,10 +334,21 @@ static int trace(pid_t first_proc, int *first_exit_code)
     {
         int status;
         pid_t tid;
+        int cpu_time;
         struct Process *process;
 
         /* Wait for a process */
+#if NO_WAIT3
         tid = waitpid(-1, &status, __WALL);
+        cpu_time = -1;
+#else
+        {
+            struct rusage res;
+            tid = wait3(&status, __WALL, &res);
+            cpu_time = (res.ru_utime.tv_sec * 1000 +
+                        res.ru_utime.tv_usec / 1000);
+        }
+#endif
         if(tid == -1)
         {
             /* LCOV_EXCL_START : internal error: waitpid() won't fail unless we
@@ -310,16 +372,20 @@ static int trace(pid_t first_proc, int *first_exit_code)
             process = trace_find_process(tid);
             if(process != NULL)
             {
-                if(db_add_exit(process->identifier, exitcode) != 0)
+                int cpu_time_val = -1;
+                if(process->tid == process->threadgroup->tgid)
+                    cpu_time_val = cpu_time;
+                if(db_add_exit(process->identifier, exitcode,
+                               cpu_time_val) != 0)
                     return -1;
-                free(process->wd);
-                process->status = PROCESS_FREE;
+                trace_free_process(process);
             }
             trace_count_processes(&nprocs, &unknown);
             if(verbosity >= 2)
-                log_info(tid, "process exited (%s %d), %d processes remain",
+                log_info(tid, "process exited (%s %d), CPU time %.2f, "
+                         "%d processes remain",
                          (exitcode & 0x0100)?"signal":"code", exitcode & 0xFF,
-                         (unsigned int)nprocs);
+                         cpu_time * 0.001f, (unsigned int)nprocs);
             if(nprocs <= 0)
                 break;
             if(unknown >= nprocs)
@@ -342,18 +408,19 @@ static int trace(pid_t first_proc, int *first_exit_code)
             if(verbosity >= 3)
                 log_debug(tid, "process appeared");
             process = trace_get_empty_process();
-            process->status = PROCESS_UNKNOWN;
+            process->status = PROCSTAT_UNKNOWN;
+            process->flags = 0;
             process->tid = tid;
+            process->threadgroup = NULL;
             process->in_syscall = 0;
-            process->wd = NULL;
             trace_set_options(tid);
             /* Don't resume, it will be set to ATTACHED and resumed when fork()
              * returns */
             continue;
         }
-        else if(process->status == PROCESS_ALLOCATED)
+        else if(process->status == PROCSTAT_ALLOCATED)
         {
-            process->status = PROCESS_ATTACHED;
+            process->status = PROCSTAT_ATTACHED;
 
             if(verbosity >= 3)
                 log_debug(tid, "process attached");
@@ -400,7 +467,7 @@ static int trace(pid_t first_proc, int *first_exit_code)
                 /* LCOV_EXCL_END */
             }
 #if defined(I386)
-            if(!process->in_syscall || regs.orig_eax >= 0)
+            if(!process->in_syscall)
                 process->current_syscall = regs.orig_eax;
             if(process->in_syscall)
                 get_i386_reg(&process->retvalue, regs.eax);
@@ -423,7 +490,7 @@ static int trace(pid_t first_proc, int *first_exit_code)
             {
                 /* 32 bit mode */
                 struct i386_regs *x86regs = (struct i386_regs*)&regs;
-                if(!process->in_syscall || x86regs->orig_eax >= 0)
+                if(!process->in_syscall)
                     process->current_syscall = x86regs->orig_eax;
                 if(process->in_syscall)
                     get_i386_reg(&process->retvalue, x86regs->eax);
@@ -441,7 +508,7 @@ static int trace(pid_t first_proc, int *first_exit_code)
             else
             {
                 /* 64 bit mode */
-                if(!process->in_syscall || regs.orig_rax >= 0)
+                if(!process->in_syscall)
                     process->current_syscall = regs.orig_rax;
                 if(process->in_syscall)
                     get_x86_64_reg(&process->retvalue, regs.rax);
@@ -468,13 +535,31 @@ static int trace(pid_t first_proc, int *first_exit_code)
 
             /* Synthetic signal for ptrace event: resume */
             if(signum == SIGTRAP && status & 0xFF0000)
+            {
+                int event = status >> 16;
+                if(event == PTRACE_EVENT_EXEC)
+                {
+                    log_debug(tid,
+                             "got EVENT_EXEC, an execve() was successful and "
+                             "will return soon");
+                    if(syscall_execve_event(process) != 0)
+                        return -1;
+                }
+                else if( (event == PTRACE_EVENT_FORK)
+                      || (event == PTRACE_EVENT_VFORK)
+                      || (event == PTRACE_EVENT_CLONE))
+                {
+                    if(syscall_fork_event(process, event) != 0)
+                        return -1;
+                }
                 ptrace(PTRACE_SYSCALL, tid, NULL, NULL);
+            }
             else if(signum == SIGTRAP)
             {
                 /* LCOV_EXCL_START : Processes shouldn't be getting SIGTRAPs */
-                log_warn(0,
-                         "NOT delivering SIGTRAP to %d\n"
-                         "    waitstatus=0x%X", tid, status);
+                log_error(0,
+                          "NOT delivering SIGTRAP to %d\n"
+                          "    waitstatus=0x%X", tid, status);
                 ptrace(PTRACE_SYSCALL, tid, NULL, NULL);
                 /* LCOV_EXCL_END */
             }
@@ -502,13 +587,30 @@ static int trace(pid_t first_proc, int *first_exit_code)
     return 0;
 }
 
+static void (*python_sigchld_handler)(int) = NULL;
+static void (*python_sigint_handler)(int) = NULL;
+
+static void restore_signals(void)
+{
+    if(python_sigchld_handler != NULL)
+    {
+        signal(SIGCHLD, python_sigchld_handler);
+        python_sigchld_handler = NULL;
+    }
+    if(python_sigint_handler != NULL)
+    {
+        signal(SIGINT, python_sigint_handler);
+        python_sigint_handler = NULL;
+    }
+}
+
 static void cleanup(void)
 {
     size_t i;
     {
         size_t nb = 0;
         for(i = 0; i < processes_size; ++i)
-            if(processes[i]->status != PROCESS_FREE)
+            if(processes[i]->status != PROCSTAT_FREE)
                 ++nb;
         /* size_t size is implementation dependent; %u for size_t can trigger
          * a warning */
@@ -516,10 +618,10 @@ static void cleanup(void)
     }
     for(i = 0; i < processes_size; ++i)
     {
-        if(processes[i]->status != PROCESS_FREE)
+        if(processes[i]->status != PROCSTAT_FREE)
         {
             kill(processes[i]->tid, SIGKILL);
-            free(processes[i]->wd);
+            trace_free_process(processes[i]);
         }
     }
 }
@@ -535,6 +637,7 @@ static void sigint_handler(int signo)
         if(verbosity >= 1)
             log_error(0, "cleaning up on SIGINT");
         cleanup();
+        restore_signals();
         exit(1);
     }
     else if(verbosity >= 1)
@@ -544,8 +647,9 @@ static void sigint_handler(int signo)
 
 static void trace_init(void)
 {
-    signal(SIGCHLD, SIG_DFL);
-    signal(SIGINT, sigint_handler);
+    /* Store Python's handlers for restore_signals() */
+    python_sigchld_handler = signal(SIGCHLD, SIG_DFL);
+    python_sigint_handler = signal(SIGINT, sigint_handler);
 
     if(processes == NULL)
     {
@@ -557,11 +661,9 @@ static void trace_init(void)
         for(i = 0; i < processes_size; ++i)
         {
             processes[i] = pool++;
-            processes[i]->status = PROCESS_FREE;
-            processes[i]->in_syscall = 0;
-            processes[i]->current_syscall = -1;
-            processes[i]->syscall_info = NULL;
-            processes[i]->wd = NULL;
+            processes[i]->status = PROCSTAT_FREE;
+            processes[i]->threadgroup = NULL;
+            processes[i]->execve_info = NULL;
         }
     }
 
@@ -586,7 +688,16 @@ int fork_and_trace(const char *binary, int argc, char **argv,
         memcpy(args, argv, argc * sizeof(char*));
         args[argc] = NULL;
         /* Trace this process */
-        ptrace(PTRACE_TRACEME, 0, NULL, NULL);
+        if(ptrace(PTRACE_TRACEME, 0, NULL, NULL) != 0)
+        {
+            log_critical(
+                0,
+                "couldn't use ptrace: %s\n"
+                "This could be caused by a security policy or isolation "
+                "mechanism (such as\n Docker), see http://bit.ly/2bZd8Fa",
+                strerror(errno));
+            exit(1);
+        }
         /* Stop this once so tracer can set options */
         kill(getpid(), SIGSTOP);
         /* Execute the target */
@@ -601,33 +712,43 @@ int fork_and_trace(const char *binary, int argc, char **argv,
         char logfilename[1024];
         strcpy(logfilename, getenv("HOME"));
         strcat(logfilename, "/.reprozip/log");
-        log_open_file(logfilename);
+        if(log_open_file(logfilename) != 0)
+        {
+            restore_signals();
+            return 1;
+        }
     }
 
     if(db_init(database_path) != 0)
     {
         kill(child, SIGKILL);
         log_close_file();
+        restore_signals();
         return 1;
     }
 
     /* Creates entry for first process */
     {
         struct Process *process = trace_get_empty_process();
-        process->status = PROCESS_ALLOCATED; /* Not yet attached... */
+        process->status = PROCSTAT_ALLOCATED; /* Not yet attached... */
+        process->flags = 0;
         /* We sent a SIGSTOP, but we resume on attach */
         process->tid = child;
-        process->tgid = child;
+        process->threadgroup = trace_new_threadgroup(child, get_wd());
         process->in_syscall = 0;
-        process->wd = get_wd();
 
         if(verbosity >= 2)
             log_info(0, "process %d created by initial fork()", child);
-        if(db_add_first_process(&process->identifier, process->wd) != 0)
+        if( (db_add_first_process(&process->identifier,
+                                  process->threadgroup->wd) != 0)
+         || (db_add_file_open(process->identifier, process->threadgroup->wd,
+                              FILE_WDIR, 1) != 0) )
         {
             /* LCOV_EXCL_START : Database insertion shouldn't fail */
+            db_close(1);
             cleanup();
             log_close_file();
+            restore_signals();
             return 1;
             /* LCOV_EXCL_END */
         }
@@ -636,16 +757,20 @@ int fork_and_trace(const char *binary, int argc, char **argv,
     if(trace(child, exit_status) != 0)
     {
         cleanup();
-        db_close();
+        db_close(1);
         log_close_file();
+        restore_signals();
         return 1;
     }
 
-    if(db_close() != 0)
+    if(db_close(0) != 0)
     {
         log_close_file();
+        restore_signals();
         return 1;
     }
 
+    log_close_file();
+    restore_signals();
     return 0;
 }

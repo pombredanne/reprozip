@@ -1,4 +1,4 @@
-# Copyright (C) 2014 New York University
+# Copyright (C) 2014-2016 New York University
 # This file is part of ReproZip which is released under the Revised BSD License
 # See file LICENSE for full license details.
 
@@ -10,16 +10,18 @@ setuptools. It is also callable directly.
 It dispatchs to other routines, or handles the testrun command.
 """
 
-from __future__ import unicode_literals
+from __future__ import division, print_function, unicode_literals
+
+if __name__ == '__main__':  # noqa
+    from reprozip.main import main
+    main()
 
 import argparse
-import codecs
 import locale
 import logging
 import os
 from rpaths import Path
 import sqlite3
-import string
 import sys
 
 from reprozip import __version__ as reprozip_version
@@ -29,15 +31,22 @@ from reprozip.common import setup_logging, \
     submit_usage_report, record_usage
 import reprozip.pack
 import reprozip.tracer.trace
-from reprozip.utils import PY3, unicode_
+import reprozip.traceutils
+from reprozip.utils import PY3, unicode_, stderr
+
+
+safe_shell_chars = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                       "abcdefghijklmnopqrstuvwxyz"
+                       "0123456789"
+                       "-+=/:.,%_")
 
 
 def shell_escape(s):
-    """Given bl"a, returns "bl\\"a".
+    r"""Given bl"a, returns "bl\\"a".
     """
     if isinstance(s, bytes):
         s = s.decode('utf-8')
-    if any(c in s for c in string.whitespace + '*$\\"\''):
+    if not s or any(c not in safe_shell_chars for c in s):
         return '"%s"' % (s.replace('\\', '\\\\')
                           .replace('"', '\\"')
                           .replace('$', '\\$'))
@@ -58,16 +67,19 @@ def print_db(database):
 
     cur = conn.cursor()
     processes = cur.execute(
-            '''
-            SELECT id, parent, timestamp, exitcode
-            FROM processes;
-            ''')
+        '''
+        SELECT id, parent, timestamp, exit_timestamp, exitcode, cpu_time
+        FROM processes;
+        ''')
     print("\nProcesses:")
-    header = "+------+--------+-------+------------------+"
+    header = ("+------+--------+-------+------------------+------------------+"
+              "----------+")
     print(header)
-    print("|  id  | parent |  exit |     timestamp    |")
+    print("|  id  | parent |  exit |     timestamp    |  exit timestamp  |"
+          " cpu time |")
     print(header)
-    for r_id, r_parent, r_timestamp, r_exit in processes:
+    for (r_id, r_parent, r_timestamp, r_endtime,
+            r_exit, r_cpu_time) in processes:
         f_id = "{0: 5d} ".format(r_id)
         if r_parent is not None:
             f_parent = "{0: 7d} ".format(r_parent)
@@ -78,16 +90,22 @@ def print_db(database):
         else:
             f_exit = "    {0: <2d} ".format(r_exit)
         f_timestamp = "{0: 17d} ".format(r_timestamp)
-        print('|'.join(('', f_id, f_parent, f_exit, f_timestamp, '')))
+        f_endtime = "{0: 17d} ".format(r_endtime)
+        if r_cpu_time >= 0:
+            f_cputime = "{0: 9.2f} ".format(r_cpu_time * 0.001)
+        else:
+            f_cputime = "          "
+        print('|'.join(('', f_id, f_parent, f_exit,
+                        f_timestamp, f_endtime, f_cputime, '')))
         print(header)
     cur.close()
 
     cur = conn.cursor()
     processes = cur.execute(
-            '''
-            SELECT id, name, timestamp, process, argv
-            FROM executed_files;
-            ''')
+        '''
+        SELECT id, name, timestamp, process, argv
+        FROM executed_files;
+        ''')
     print("\nExecuted files:")
     header = ("+--------+------------------+---------+------------------------"
               "---------------+")
@@ -112,10 +130,10 @@ def print_db(database):
 
     cur = conn.cursor()
     processes = cur.execute(
-            '''
-            SELECT id, name, timestamp, mode, process
-            FROM opened_files;
-            ''')
+        '''
+        SELECT id, name, timestamp, mode, process
+        FROM opened_files;
+        ''')
     print("\nFiles:")
     header = ("+--------+------------------+---------+------+-----------------"
               "---------------+")
@@ -132,6 +150,32 @@ def print_db(database):
         print('|'.join(('', f_id, f_timestamp, f_proc, f_mode, f_name, '')))
         print(header)
     cur.close()
+
+    cur = conn.cursor()
+    connections = cur.execute(
+        '''
+        SELECT DISTINCT inbound, family, protocol, address
+        FROM connections
+        ORDER BY inbound, family, timestamp;
+        ''')
+    header_shown = -1
+    current_family = current_protocol = None
+    for r_inbound, r_family, r_protocol, r_address in connections:
+        if header_shown < r_inbound:
+            if r_inbound:
+                print("\nIncoming connections:")
+            else:
+                print("\nRemote connections:")
+            header_shown = r_inbound
+            current_family = None
+        if current_family != r_family:
+            print("    %s" % r_family)
+            current_family = r_family
+            current_protocol = None
+        if current_protocol != r_protocol:
+            print("      %s" % r_protocol)
+            current_protocol = r_protocol
+        print("        %s" % r_address)
 
     conn.close()
 
@@ -177,13 +221,23 @@ def trace(args):
         argv = [args.arg0] + args.cmdline[1:]
     else:
         argv = args.cmdline
+    if args.append and args.overwrite:
+        logging.critical("You can't use both --continue and --overwrite")
+        sys.exit(2)
+    elif args.append:
+        append = True
+    elif args.overwrite:
+        append = False
+    else:
+        append = None
     reprozip.tracer.trace.trace(args.cmdline[0],
                                 argv,
                                 Path(args.dir),
-                                args.append,
+                                append,
                                 args.verbosity)
     reprozip.tracer.trace.write_configuration(Path(args.dir),
                                               args.identify_packages,
+                                              args.find_inputs_outputs,
                                               overwrite=False)
 
 
@@ -195,6 +249,7 @@ def reset(args):
     """
     reprozip.tracer.trace.write_configuration(Path(args.dir),
                                               args.identify_packages,
+                                              args.find_inputs_outputs,
                                               overwrite=True)
 
 
@@ -205,15 +260,40 @@ def pack(args):
     """
     target = Path(args.target)
     if not target.unicodename.lower().endswith('.rpz'):
-        target = Path(target.path + '.rpz')
+        target = Path(target.path + b'.rpz')
         logging.warning("Changing output filename to %s", target.unicodename)
     reprozip.pack.pack(target, Path(args.dir), args.identify_packages)
+
+
+def combine(args):
+    """combine subcommand.
+
+    Reads in multiple trace databases and combines them into one.
+
+    The runs from the original traces are appended ('run_id' field gets
+    translated to avoid conflicts).
+    """
+    traces = []
+    for tracepath in args.traces:
+        if tracepath == '-':
+            tracepath = Path(args.dir) / 'trace.sqlite3'
+        else:
+            tracepath = Path(tracepath)
+            if tracepath.is_dir():
+                tracepath = tracepath / 'trace.sqlite3'
+        traces.append(tracepath)
+
+    reprozip.traceutils.combine_traces(traces, Path(args.dir))
+    reprozip.tracer.trace.write_configuration(Path(args.dir),
+                                              args.identify_packages,
+                                              args.find_inputs_outputs,
+                                              overwrite=True)
 
 
 def usage_report(args):
     if bool(args.enable) == bool(args.disable):
         logging.critical("What do you want to do?")
-        sys.exit(1)
+        sys.exit(2)
     enable_usage_report(args.enable)
     sys.exit(0)
 
@@ -224,100 +304,114 @@ def main():
     # Locale
     locale.setlocale(locale.LC_ALL, '')
 
-    # Encoding for output streams
-    if str == bytes:  # PY2
-        writer = codecs.getwriter(locale.getpreferredencoding())
-        o_stdout, o_stderr = sys.stdout, sys.stderr
-        sys.stdout = writer(sys.stdout)
-        sys.stdout.buffer = o_stdout
-        sys.stderr = writer(sys.stderr)
-        sys.stderr.buffer = o_stderr
-
     # http://bugs.python.org/issue13676
     # This prevents reprozip from reading argv and envp arrays from trace
     if sys.version_info < (2, 7, 3):
-        sys.stderr.write("Error: your version of Python, %s, is not "
-                         "supported\nVersions before 2.7.3 are affected by "
-                         "bug 13676 and will not work with ReproZip\n" %
-                         sys.version.split(' ', 1)[0])
+        stderr.write("Error: your version of Python, %s, is not supported\n"
+                     "Versions before 2.7.3 are affected by bug 13676 and "
+                     "will not work with ReproZip\n" %
+                     sys.version.split(' ', 1)[0])
         sys.exit(1)
 
     # Parses command-line
 
     # General options
-    options = argparse.ArgumentParser(add_help=False)
-    options.add_argument('--version', action='version',
+    def add_options(opt):
+        opt.add_argument('--version', action='version',
                          version="reprozip version %s" % reprozip_version)
-    options.add_argument('-v', '--verbose', action='count', default=1,
-                         dest='verbosity',
-                         help="augments verbosity level")
-    options.add_argument('-d', '--dir', default='.reprozip-trace',
+        opt.add_argument('-d', '--dir', default='.reprozip-trace',
                          help="where to store database and configuration file "
                          "(default: ./.reprozip-trace)")
-    options.add_argument(
+        opt.add_argument(
             '--dont-identify-packages', action='store_false', default=True,
             dest='identify_packages',
             help="do not try identify which package each file comes from")
+        opt.add_argument(
+            '--dont-find-inputs-outputs', action='store_false',
+            default=True, dest='find_inputs_outputs',
+            help="do not try to identify input and output files")
 
     parser = argparse.ArgumentParser(
-            description="reprozip is the ReproZip component responsible for "
-                        "tracing and packing the execution of an experiment",
-            epilog="Please report issues to reprozip-users@vgc.poly.edu",
-            parents=[options])
+        description="reprozip is the ReproZip component responsible for "
+                    "tracing and packing the execution of an experiment",
+        epilog="Please report issues to reprozip-users@vgc.poly.edu")
+    add_options(parser)
+    parser.add_argument('-v', '--verbose', action='count', default=1,
+                        dest='verbosity',
+                        help="augments verbosity level")
     subparsers = parser.add_subparsers(title="commands", metavar='',
                                        dest='selected_command')
 
     # usage_report subcommand
     parser_stats = subparsers.add_parser(
-            'usage_report', parents=[options],
-            help="Enables or disables anonymous usage reports")
+        'usage_report',
+        help="Enables or disables anonymous usage reports")
+    add_options(parser_stats)
     parser_stats.add_argument('--enable', action='store_true')
     parser_stats.add_argument('--disable', action='store_true')
     parser_stats.set_defaults(func=usage_report)
 
     # trace command
     parser_trace = subparsers.add_parser(
-            'trace', parents=[options],
-            help="Runs the program and writes out database and configuration "
-            "file")
+        'trace',
+        help="Runs the program and writes out database and configuration file")
+    add_options(parser_trace)
     parser_trace.add_argument(
-            '-a',
-            dest='arg0',
-            help="argument 0 to program, if different from program path")
+        '-a',
+        dest='arg0',
+        help="argument 0 to program, if different from program path")
     parser_trace.add_argument(
-            '-c', '--continue', action='store_true', dest='append',
-            help="add to the previous run instead of replacing it")
+        '-c', '--continue', action='store_true', dest='append',
+        help="add to the previous trace, don't replace it")
+    parser_trace.add_argument(
+        '-w', '--overwrite', action='store_true', dest='overwrite',
+        help="overwrite the previous trace, don't add to it")
     parser_trace.add_argument('cmdline', nargs=argparse.REMAINDER,
                               help="command-line to run under trace")
     parser_trace.set_defaults(func=trace)
 
     # testrun command
     parser_testrun = subparsers.add_parser(
-            'testrun', parents=[options],
-            help="Runs the program and writes out the database contents")
+        'testrun',
+        help="Runs the program and writes out the database contents")
+    add_options(parser_testrun)
     parser_testrun.add_argument(
-            '-a',
-            dest='arg0',
-            help="argument 0 to program, if different from program path")
+        '-a',
+        dest='arg0',
+        help="argument 0 to program, if different from program path")
     parser_testrun.add_argument('cmdline', nargs=argparse.REMAINDER)
     parser_testrun.set_defaults(func=testrun)
 
     # reset command
     parser_reset = subparsers.add_parser(
-            'reset', parents=[options],
-            help="Resets the configuration file")
+        'reset',
+        help="Resets the configuration file")
+    add_options(parser_reset)
     parser_reset.set_defaults(func=reset)
 
     # pack command
     parser_pack = subparsers.add_parser(
-            'pack', parents=[options],
-            help="Packs the experiment according to the current configuration")
-    parser_pack.add_argument('target', nargs='?', default='experiment.rpz',
+        'pack',
+        help="Packs the experiment according to the current configuration")
+    add_options(parser_pack)
+    parser_pack.add_argument('target', nargs=argparse.OPTIONAL,
+                             default='experiment.rpz',
                              help="Destination file")
     parser_pack.set_defaults(func=pack)
 
+    # combine command
+    parser_combine = subparsers.add_parser(
+        'combine',
+        help="Combine multiple traces into one (possibly as subsequent runs)")
+    add_options(parser_combine)
+    parser_combine.add_argument('traces', nargs=argparse.ONE_OR_MORE)
+    parser_combine.set_defaults(func=combine)
+
     args = parser.parse_args()
     setup_logging('REPROZIP', args.verbosity)
+    if getattr(args, 'func', None) is None:
+        parser.print_help(sys.stderr)
+        sys.exit(2)
     setup_usage_report('reprozip', reprozip_version)
     if 'cmdline' in args and not args.cmdline:
         parser.error("missing command-line")
@@ -326,10 +420,7 @@ def main():
         args.func(args)
     except Exception as e:
         submit_usage_report(result=type(e).__name__)
+        raise
     else:
         submit_usage_report(result='success')
     sys.exit(0)
-
-
-if __name__ == '__main__':
-    main()

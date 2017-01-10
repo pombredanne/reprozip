@@ -1,13 +1,19 @@
 #!/bin/sh
 
+set -eux
+
 case "$TEST_MODE"
 in
-    coverage_py)
+    coverage)
+        # Python
         if [ -f .coverage ]; then mv .coverage .coverage.orig; fi # FIXME: useless?
         coverage combine
-        python -c "import coveralls.cli; coveralls.cli.main()"
-        ;;
-    coverage_c)
-        python -c "import cpp_coveralls; cpp_coveralls.run()" --verbose --build-root "$PWD/reprozip"
+        codecov
+
+        # C
+        # Find the coverage file (in distutils's build directory)
+        OBJDIR=$(dirname "$(find . -name pytracer.gcno | head -n 1)")
+        (cd reprozip/native && gcov -o ../../$OBJDIR *.c)
+        curl -s -o - https://codecov.io/bash | bash -
         ;;
 esac

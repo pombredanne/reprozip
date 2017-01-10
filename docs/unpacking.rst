@@ -17,28 +17,43 @@ Before unpacking an experiment, it is often useful to have further information w
 
     $ reprounzip info <package>
 
-where `<package>` corresponds to the experiment package (i.e.: the ``.rpz`` file). You can use ``-v`` for `verbose` to get more detailed information on the package.
+where `<package>` corresponds to the experiment package (i.e., the ``.rpz`` file).
 
-The output of this command has three sections. The first section, `Pack Information`, contains general information about the experiment package, including size and total number of files::
+The output of this command has three sections. The first section, `Pack information`, contains general information about the experiment package, including size and total number of files::
 
     ----- Pack information -----
     Compressed size: <compressed-size>
     Unpacked size: <unpacked-size>
     Total packed paths: <number>
 
-The next section, `Metadata`, contains information about dependencies (i.e., software packages), machine architecture from the packing environment, and experiment execution::
+The next section, `Metadata`, contains information about dependencies (i.e., software packages), machine architecture from the packing environment, and experiment runs::
 
     ----- Metadata -----
     Total software packages: <total-number-software-packages>
     Packed software packages: <number-packed-software-packages>
     Architecture: <original-architecture> (current: <current-architecture>)
     Distribution: <original-operating-system> (current: <current-operating-system>)
-    Executions:
-        <command-line>
-            wd: <working-directory>
-            exitcode: 0
+    Runs:
+        <run-id>: <command-line>
+        <run-id>: <command-line>
+        ...
 
 Note that, for `Architecture` and `Distribution`, the command shows information with respect to both the original environment (i.e., the environment where the experiment was packed) and the current one (i.e., the environment where the experiment is to be unpacked). This helps users understand the differences between the environments in order to provide a better guidance in choosing the most appropriate unpacker.
+
+If the verbose mode is used, more detailed information on the runs is provided::
+
+    $ reprounzip -v info <package>
+    ...
+    ----- Metadata -----
+    ...
+    Runs:
+        <run-id>: <command-line>
+            wd: <working-directory>
+            exitcode: <exit-code>
+        <run-id>: <command-line>
+            wd: <working-directory>
+            exitcode: <exit-code>
+        ...
 
 Last, the section `Unpackers` shows which of the installed *reprounzip* unpackers can be successfully used in the current environment::
 
@@ -50,9 +65,7 @@ Last, the section `Unpackers` shows which of the installed *reprounzip* unpacker
     Unknown:
         ...
 
-`Compatible` lists the unpackers that can be used in the current environment, while `Incompatible` lists the unpackers that are not supported in the current environment. An additional `Unknown` list shows the installed unpackers that might not work.
-
-As an example, for an experiment originally packed on Ubuntu and a user reproducing it on Windows, the `vagrant` unpacker (available through the :ref:`reprounzip-vagrant <unpack-vagrant>` plugin) is compatible, but :ref:`installpkgs <unpack-installpkgs>` is not; `vagrant` may also be listed under `Unknown` if the `vagrant` command is not found in PATH (e.g.: if `Vagrant <https://www.vagrantup.com/>`_ is not installed).
+`Compatible` lists the unpackers that can be used in the current environment, while `Incompatible` lists the unpackers that are not supported in the current environment. When using the verbose mode, an additional `Unknown` list shows the installed unpackers that may not work. As an example, for an experiment originally packed on Ubuntu and a user reproducing it on Windows, the `vagrant` unpacker (available through the :ref:`reprounzip-vagrant <unpack-vagrant>` plugin) is compatible, but :ref:`installpkgs <unpack-installpkgs>` is not; `vagrant` may also be listed under `Unknown` if ``vagrant`` is not in PATH (e.g.: if `Vagrant <https://www.vagrantup.com/>`__ is not installed).
 
 ..  _showfiles:
 
@@ -70,26 +83,47 @@ The ``reprounzip showfiles`` command can be used to list the input and output fi
         rendered_image
         logfile
 
-Using the flag ``-v`` shows the complete path of each of these files in the experiment environment.
+Using the flag ``-v`` shows the complete path of each of these files in the experiment environment::
 
-This command is particularly useful if you want to replace an input file with your own, or to get and save an output file for further examination. Please refer to :ref:`unpacker-input-output` for more information.
+    $ reprounzip -v showfiles package.rpz
+    Input files:
+        program_config (/home/user/.progrc)
+        ipython_config (/home/user/.ipython/profile_default/ipython_config.py)
+        input_data (/home/user/experiment/input.bin)
+    Output files:
+        rendered_image (/home/user/experiment/output.png)
+        logfile (/home/user/experiment/log.txt)
+
+You can use the ``--input`` or ``--output`` flags to show only files that are inputs or outputs. If the package contains multiple runs, you can also filter files for a specific run::
+
+    $ reprounzip -v showfiles package.rpz preprocessing-step
+    Input files:
+        input_data (/home/user/experiment/input.bin)
+    Output files:
+        logfile (/home/user/experiment/log.txt)
+
+where `preprocessing-step` is the run id. To see the dataflow of the experiment, please refer to :ref:`graph`.
+
+The ``reprounzip showfiles`` command is particularly useful if you want to replace an input file with your own, or to get and save an output file for further examination. Please refer to :ref:`unpacker-input-output` for more information.
+
+..  versionadded:: 1.0.4
+    The ``--input`` and ``--output`` flags.
+
+..  _provenance-graph:
 
 Creating a Provenance Graph
 +++++++++++++++++++++++++++
 
-ReproZip also allows users to generate a *provenance graph* related to the experiment execution. This graph shows the relationships between files, library dependencies, and binaries during the execution. To generate such a graph, the ``reprounzip graph`` command should be used::
+ReproZip also allows users to generate a *provenance graph* related to the experiment execution by reading the metadata available in the ``.rpz`` package. This graph shows the experiment runs as well as the files and other dependencies they access during execution; this is particularly useful to visualize and understand the dataflow of the experiment.
 
-    $ reprounzip graph package.rpz graph-file.dot
-    $ dot -Tpng graph-file.dot -o image.png
+See :ref:`graph` for details.
 
-where `graph-file.dot` corresponds to the graph, outputted in the `DOT <http://en.wikipedia.org/wiki/DOT_(graph_description_language)>`_ language.
-
-..  note:: If you are using a Python version older than 2.7.3, this feature will not be available due to `Python bug 13676 <http://bugs.python.org/issue13676>`_ related to sqlite3.
+..  _unpack-unpackers:
 
 Unpackers
 =========
 
-From the same ``.rpz`` package, `reprounzip` allows users to set up the experiment for reproduction in several ways by the use of different `unpackers`. Unpackers are plugins that have general interface and commands, but that can also provide their own command-line syntax and options. Thanks to the decoupling between packing and unpacking steps, ``.rpz`` files from older versions of ReproZip can be used with new unpackers.
+From the same ``.rpz`` package, `reprounzip` allows users to set up the experiment for reproduction in several ways by the use of different `unpackers`. Unpackers are plugins that have general interface and commands, but can also provide their own command-line syntax and options. Thanks to the decoupling between packing and unpacking steps, ``.rpz`` files from older versions of ReproZip can be used with new unpackers.
 
 The `reprounzip` tool comes with three unpackers that are only compatible with Linux (``reprounzip directory``, ``reprounzip chroot``, and ``reprounzip installpkgs``). Additional unpackers, such as ``reprounzip vagrant`` and ``reprounzip docker``, can be installed separately. Next, each unpacker is described in more details; for more information on how to use an unpacker, please refer to :ref:`unpacker-commands`.
 
@@ -106,7 +140,7 @@ Please note that, although this unpacker is easy to use and does not require any
 
 ..  note:: ``reprounzip directory`` is automatically distributed with `reprounzip`.
 
-..  seealso:: :ref:`directory_error`
+..  seealso:: :ref:`Why does 'reprounzip directory' fail with "IOError"? <directory_error>`
 
 ..  _unpack-chroot:
 
@@ -128,13 +162,15 @@ The `installpkgs` Unpacker: Installing Software Packages
 
 By default, ReproZip identifies if the current environment already has the required software packages for the experiment, then using the installed ones for reproduction. For the non-installed software packages, it uses the dependencies packed in the original environment and extracted under the experiment directory.
 
-Users may also let ReproZip try and install all the dependencies of the experiment on their machine by using the *installpkgs* unpacker (``reprounzip installpkgs``). This unpacker currently works for Debian and Debian-based operating systems only (e.g.: Ubuntu), and uses the `dpkg <http://en.wikipedia.org/wiki/Dpkg>`_ package manager to automatically install all the required software packages directly on the current machine, thus **interfering with your environment**.
+Users may also let ReproZip try and install all the dependencies of the experiment on their machine by using the *installpkgs* unpacker (``reprounzip installpkgs``). This unpacker currently works for distribution based on Debian or RPM packages (e.g.: Ubuntu, CentOS, Fedora, ...), and uses the package manager to automatically install all the required software packages directly on the current machine, thus **interfering with your environment**.
 
 To install the required dependencies, the following command should be used::
 
     $ reprounzip installpkgs <package>
 
 Users may use flag *y* or *assume-yes* to automatically confirm all the questions from the package manager; flag *missing* to install only the software packages that were not originally included in the experiment package (i.e.: software packages excluded in the configuration file); and flag *summary* to simply provide a summary of which software packages are installed or not in the current environment **without installing any dependency**.
+
+..  warning:: Note that the package manager may not install the same software version as required for running the experiment, and if the versions are incompatible, the reproduction may fail.
 
 ..  note:: This unpacker is only used to install software packages. Users still need to use either ``reprounzip directory`` or ``reprounzip chroot`` to extract the experiment and execute it.
 
@@ -147,23 +183,37 @@ Users may use flag *y* or *assume-yes* to automatically confirm all the question
 The `vagrant` Unpacker: Building a Virtual Machine
 ++++++++++++++++++++++++++++++++++++++++++++++++++
 
-The *vagrant* unpacker (``reprounzip vagrant``) allows an experiment to be unpacked and reproduced using a virtual machine created through `Vagrant <https://www.vagrantup.com/>`_. Therefore, the experiment can be reproduced in any environment supported by this tool, i.e., Linux, Mac OS X, and Windows. Note that the plugin assumes that Vagrant is installed in the current environment.
+The *vagrant* unpacker (``reprounzip vagrant``) allows an experiment to be unpacked into a Virtual Machine and reproduced in that emulated environment, by automatically using `Vagrant <https://www.vagrantup.com/>`__. Therefore, the experiment can be reproduced in any environment supported by this tool, i.e., Linux, Mac OS X, and Windows. Note that the plugin assumes that Vagrant and VirtualBox are installed on your machine.
 
 In addition to the commands listed in :ref:`unpacker-commands`, you can use ``suspend`` to save the virtual machine state to disk, and ``setup/start`` to restart a previously-created machine::
 
     $ reprounzip vagrant suspend <path>
     $ reprounzip vagrant setup/start <path>
-    
-..  note:: This unpacker is **not** distributed with `reprounzip`; it is a separate package that should be installed before using (see `reprounzip-vagrant plugin <https://pypi.python.org/pypi/reprounzip-vagrant/>`_).
+
+The ``setup`` command also takes a ``--memory`` argument to explicitely select how many megabytes of RAM to allocate to the virtual machine.
+
+..  note:: This unpacker is **not** distributed with `reprounzip`; it is a separate package that should be installed before use (see :ref:`install`).
+
+..  versionadded:: 1.0.1
+    The ``--memory`` option.
+
+..  versionadded:: 1.0.4
+    The ``suspend`` command.
 
 ..  _docker-plugin:
 
 The `docker` Unpacker: Building a Docker Container
 ++++++++++++++++++++++++++++++++++++++++++++++++++
 
-ReproZip can also extract and reproduce experiments as `Docker <https://www.docker.com/>`_ containers. The *docker* unpacker (``reprounzip docker``) is responsible for such integration and it assumes that Docker is already installed in the current environment.
+ReproZip can also extract and reproduce experiments as `Docker <https://www.docker.com/>`__ containers. The *docker* unpacker (``reprounzip docker``) is responsible for such integration and it assumes that Docker is already installed in the current environment.
 
-..  note:: This unpacker is **not** distributed with `reprounzip`; it is a separate package that should be installed before using (see `reprounzip-docker plugin <https://pypi.python.org/pypi/reprounzip-docker/>`_).
+You can pass arguments to the ``docker(1)`` program by using the ``--docker-option`` option to the ``setup`` or ``run`` commands.
+
+Thanks to Docker's image layers feature, you can easily go back to the initial image after having run commands in the environment or replaced input files. To do that, use the ``reset`` command::
+
+    $ reprounzip docker reset <path>
+
+..  note:: This unpacker is **not** distributed with `reprounzip`; it is a separate package that should be installed before use (see :ref:`install`).
 
 ..  _unpacker-commands:
 
@@ -174,8 +224,12 @@ Once you have chosen (and installed) an unpacker for your machine, you can use i
 
 All the following commands need to state which unpacker is being used (i.e., ``reprounzip directory`` for the `directory` unpacker, ``reprounzip chroot`` for the `chroot` unpacker, ``reprounzip vagrant`` for the `vagrant` unpacker, and ``reprounzip docker`` for the `docker` unpacker). For the purpose of this documentation, we will use the `vagrant` unpacker; to use a different one, just replace ``vagrant`` in the following with the unpacker of your interest.
 
+..  seealso:: :ref:`unpacked-format` provides further detailed information on unpackers.
+
 Setting Up an Experiment Directory
 ++++++++++++++++++++++++++++++++++
+
+..  note:: Some unpackers require an Internet connection during the ``setup`` command, to download some of the support software or the packages that were not packed. Make sure that you have an Internet connection, and that there is no firewall blocking the access.
 
 To create the directory where the execution will take place, the ``setup`` command should be used::
 
@@ -187,8 +241,6 @@ Note that, once this is done, you should only remove `<path>` with the `destroy`
 
 The other unpacker commands take the `<path>` argument; they do not need the original package for the reproduction.
 
-..  note:: Most unpackers assume an Internet connection for the ``setup`` command and will be downloading required software from the Internet. Make sure that you have an Internet connection, and that there is no firewall blocking the access.
-
 Reproducing the Experiment
 ++++++++++++++++++++++++++
 
@@ -196,11 +248,35 @@ After creating the directory, the experiment can be reproduced by issuing the ``
 
     $ reprounzip vagrant run <path>
 
-which will execute the entire experiment inside the experiment directory. Users may also change the command line of the experiment by using ``--cmdline``::
+which will execute the experiment inside the experiment directory. Users may also change the command line of the experiment by using ``--cmdline``::
 
     $ reprounzip vagrant run <path> --cmdline <new-command-line>
 
 where `<new-command-line>` is the modified command line. This is particularly useful to reproduce and test the experiment under different input parameter values. Using ``--cmdline`` without an argument only prints the original command line.
+
+If the package contains multiple `runs` (separate commands that were packed together), all the runs are reproduced. You can also provide the id of the run or runs to be used::
+
+    $ reprounzip vagrant run <path> <run-id>
+    $ reprounzip vagrant run <path> <run-id> --cmdline <new-command-line>
+
+For example::
+
+    $ reprounzip vagrant run unpacked-experiment 0-1,3  # First, second, and fourth runs
+    $ reprounzip vagrant run unpacked-experiment 2-  # Third run and up
+    $ reprounzip vagrant run unpacked-experiment compile,test  # Runs named 'compile' and 'test', in this order
+
+If the experiment involves running a GUI tool, the graphical interface can be enable by using ``--enable-x11``::
+
+    $ reprounzip vagrant run <path> --enable-x11
+
+which will forward the X connection from the experiment to the X server running on your machine. In this case, make sure you have a running X server.
+
+Note that in some situations, you might want to pass specific environment variables to the experiment, for example to set execution limits or parameters (such as OpenMPI information). To that effect, you can use the ``--pass-env VARNAME`` option to pass variables from the current machine, overriding the value from the original packing machine (`VARNAME` can be a regex). You can also set a variable to any value using ``--set-env VARNAME=value``. For example::
+
+    $ reprounzip vagrant run unpacked-experiment --pass-env 'OMPI_.*' --pass-env LANG --set-env DATA_SERVER_ADDRESS=localhost
+
+..  versionadded:: 1.0.3
+    The ``--pass-env`` and ``-set-env`` options.
 
 Removing the Experiment Directory
 +++++++++++++++++++++++++++++++++
@@ -208,7 +284,7 @@ Removing the Experiment Directory
 The ``destroy`` command will unmount mounted paths, destroy virtual machines, free container images, and delete the experiment directory::
 
     $ reprounzip vagrant destroy <path>
-    
+
 Make sure you always use this command instead of simply deleting the directory manually.
 
 ..  _unpacker-input-output:
@@ -240,13 +316,12 @@ where `<input-path>` is the new file's path and `<input-id>` is the input file t
 
 Running the ``showfiles`` command shows what the input files are currently set to::
 
-    $ reprounzip showfiles <path>
+    $ reprounzip showfiles <path> --input
     Input files:
         program_config
             (original)
         ipython_config
             C:\Users\Remi\Documents\ipython-config
-    ...
 
 In this example, the input `program_config` has not been changed (the one bundled in the ``.rpz`` file will be used), while the input `ipython_config` has been replaced.
 
@@ -254,14 +329,32 @@ After running the experiment, all the generated output files will be located und
 
     $ reprounzip vagrant download <path> <output-id>:<output-path>
 
-where `<output-id>` is the output file to be copied (from ``showfiles``) and `<output-path>` is the desired destination of the file. If no destination is specified, the file will be printed to stdout::
+where `<output-id>` is the output file to be copied (from ``showfiles``) and `<output-path>` is the desired destination of the file. If an empty destination is specified, the file will be printed to stdout::
 
     $ reprounzip vagrant download <path> <output-id>:
 
-Note that the ``upload`` command takes the file id on the right side of the colon (meaning that the path is the origin, and the id is the destination), while the ``download`` command takes it on the left side (meaning that the id is the origin, and the path is the destination).
+You can also omit the colon ``:`` altogether to download the file to the current directory under its original name::
 
-..  seealso:: :ref:`moving-outputs`
+    $ reprounzip vagrant download <path> <output-id>
 
+or even use ``--all`` to download every output file to the current directory under their original names.
+
+Note that the ``upload`` command takes the file id on the right side of the colon (meaning that the path is the origin, and the id is the destination), while the ``download`` command takes it on the left side (meaning that the id is the origin, and the path is the destination). Both commands move  data from left to right.
+
+..  versionadded:: 1.0.4
+    Allow ``download <output-id>`` (no explicit destination), and add ``--all``.
+
+..  versionadded:: 1.1.0
+    Allow uploading and downloading any file via its full path, instead of a input/output file id.
+
+..  seealso:: :ref:`Why can’t 'reprounzip' get my output files after reproducing an experiment? <moving-outputs>`
+
+Running the Experiment in VisTrails
++++++++++++++++++++++++++++++++++++
+
+In addition to reproducing the experiment, you may want to edit its dataflow by inserting your own processes between and around the experiment steps, or even by connecting multiple ReproZip'd experiments. However, manually managing the experiment workflow (with the help of ``reprounzip upload/download`` commands) can quickly become painful.
+
+To allow users to easily manage these workflows, `reprounzip` provides a plugin for the `VisTrails <http://www.vistrails.org/>`__ scientific workflow management system, which has easy-to-use interfaces to run and modify a dataflow. See :ref:`vistrails` for more information.
 
 Further Considerations
 ======================

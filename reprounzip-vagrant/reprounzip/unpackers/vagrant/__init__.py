@@ -1,4 +1,4 @@
-# Copyright (C) 2014 New York University
+# Copyright (C) 2014-2016 New York University
 # This file is part of ReproZip which is released under the Revised BSD License
 # See file LICENSE for full license details.
 
@@ -11,143 +11,179 @@ Vagrant (``vagrant up``).
 See http://www.vagrantup.com/
 """
 
-from __future__ import unicode_literals
+from __future__ import division, print_function, unicode_literals
 
 import argparse
+from distutils.version import LooseVersion
 import logging
 import os
 import paramiko
-from paramiko.client import MissingHostKeyPolicy
-import pickle
+import re
 from rpaths import PosixPath, Path
-import scp
 import subprocess
 import sys
-import tarfile
 
-from reprounzip.common import load_config, record_usage
+from reprounzip.common import load_config, record_usage, RPZPack
 from reprounzip import signals
-from reprounzip.unpackers.common import COMPAT_OK, COMPAT_MAYBE, \
-    composite_action, target_must_exist, make_unique_name, shell_escape, \
-    select_installer, busybox_url, join_root, FileUploader, FileDownloader, \
-    get_runs
-from reprounzip.unpackers.vagrant.interaction import interactive_shell
-from reprounzip.utils import irange, unicode_, iteritems, check_output
+from reprounzip.parameters import get_parameter
+from reprounzip.unpackers.common import COMPAT_OK, COMPAT_MAYBE, COMPAT_NO, \
+    CantFindInstaller, composite_action, target_must_exist, \
+    make_unique_name, shell_escape, select_installer, busybox_url, join_root, \
+    FileUploader, FileDownloader, get_runs, add_environment_options, \
+    fixup_environment, metadata_read, metadata_write, \
+    metadata_initial_iofiles, metadata_update_run
+from reprounzip.unpackers.common.x11 import BaseX11Handler, X11Handler
+from reprounzip.unpackers.vagrant.run_command import IgnoreMissingKey, \
+    run_interactive
+from reprounzip.utils import unicode_, iteritems, stderr, download_file
 
 
-class IgnoreMissingKey(MissingHostKeyPolicy):
-    """Policy that just ignores missing SSH host keys.
-
-    We are connecting to vagrant, checking the host doesn't make sense, and
-    accepting keys permanently is a security risk.
-    """
-    def missing_host_key(self, client, hostname, key):
-        pass
-
-
-def rb_escape(s):
-    """Given bl'a, returns 'bl\\'a'.
-    """
-    return "'%s'" % (s.replace('\\', '\\\\')
-                      .replace("'", "\\'"))
-
-
-def select_box(runs):
+def select_box(runs, gui=False):
     """Selects a box for the experiment, with the correct distribution.
     """
     distribution, version = runs[0]['distribution']
     distribution = distribution.lower()
     architecture = runs[0]['architecture']
 
-    record_usage(vagrant_select_box='%s;%s;%s' % (distribution, version,
-                                                  architecture))
+    record_usage(vagrant_select_box='%s;%s;%s;gui=%s' % (distribution, version,
+                                                         architecture, gui))
 
     if architecture not in ('i686', 'x86_64'):
         logging.critical("Error: unsupported architecture %s", architecture)
         sys.exit(1)
 
-    # Ubuntu
-    if distribution == 'ubuntu':
-        if version == '12.04':
-            if architecture == 'i686':
-                return 'ubuntu', 'hashicorp/precise32'
-            else:  # architecture == 'x86_64'
-                return 'ubuntu', 'hashicorp/precise64'
-        if version != '14.04':
-            logging.warning("using Ubuntu 14.04 'Trusty' instead of '%s'",
-                            version)
-        if architecture == 'i686':
-            return 'ubuntu', 'ubuntu/trusty32'
-        else:  # architecture == 'x86_64':
-            return 'ubuntu', 'ubuntu/trusty64'
+    def find_distribution(parameter, distribution, version, architecture):
+        boxes = parameter['boxes']
 
-    # Debian
-    else:
-        if distribution != 'debian':
-            logging.warning("unsupported distribution %s, using Debian",
-                            distribution)
-            version = '7'
+        for distrib in boxes:
+            if re.match(distrib['name'], distribution) is not None:
+                result = find_version(distrib, version, architecture)
+                if result is not None:
+                    return result
+        default = parameter['default']
+        logging.warning("Unsupported distribution '%s', using %s",
+                        distribution, default['name'])
+        result = default['architectures'].get(architecture)
+        if result:
+            return default['distribution'], result
 
-        if (version != '7' and not version.startswith('7.') and
-                not version.startswith('wheezy')):
-            logging.warning("using Debian 7 'Wheezy' instead of '%s'", version)
+    def find_version(distrib, version, architecture):
+        if version is not None:
+            for box in distrib['versions']:
+                if re.match(box['version'], version) is not None:
+                    result = box['architectures'].get(architecture)
+                    if result is not None:
+                        return box['distribution'], result
+        box = distrib['default']
+        if version is not None:
+            logging.warning("Using %s instead of '%s'",
+                            box['name'], version)
+        result = box['architectures'].get(architecture)
+        if result is not None:
+            return box['distribution'], result
 
-        if architecture == 'i686':
-            return 'debian', 'remram/debian-7-i386'
-        else:  # architecture == 'x86_64':
-            return 'debian', 'remram/debian-7-amd64'
-
-
-def write_dict(filename, dct):
-    to_write = {'unpacker': 'vagrant'}
-    to_write.update(dct)
-    with filename.open('wb') as fp:
-        pickle.dump(to_write, fp, 2)
-
-
-def read_dict(filename):
-    with filename.open('rb') as fp:
-        dct = pickle.load(fp)
-    if dct['unpacker'] != 'vagrant':
-        raise ValueError("Wrong unpacker used: %s != vagrant" %
-                         dct['unpacker'])
-    return dct
+    result = find_distribution(
+        get_parameter('vagrant_boxes_x' if gui else 'vagrant_boxes'),
+        distribution, version, architecture)
+    if result is None:
+        logging.critical("Error: couldn't find a base box for required "
+                         "architecture")
+        sys.exit(1)
+    return result
 
 
-def get_ssh_parameters(target):
-    """Reads the SSH parameters from ``vagrant ssh`` command output.
+def write_dict(path, dct):
+    metadata_write(path, dct, 'vagrant')
+
+
+def read_dict(path):
+    return metadata_read(path, 'vagrant')
+
+
+def machine_setup(target):
+    """Prepare the machine and get SSH parameters from ``vagrant ssh``.
     """
     try:
-        stdout = check_output(['vagrant', 'ssh-config'],
-                              cwd=target.path,
-                              stderr=subprocess.PIPE)
+        out = subprocess.check_output(['vagrant', 'ssh-config'],
+                                      cwd=target.path,
+                                      stderr=subprocess.PIPE)
     except subprocess.CalledProcessError:
         # Makes sure the VM is running
-        subprocess.check_call(['vagrant', 'up'],
-                              cwd=target.path)
+        logging.info("Calling 'vagrant up'...")
+        try:
+            retcode = subprocess.check_call(['vagrant', 'up'], cwd=target.path)
+        except OSError:
+            logging.critical("vagrant executable not found")
+            sys.exit(1)
+        else:
+            if retcode != 0:
+                logging.critical("vagrant up failed with code %d", retcode)
+                sys.exit(1)
         # Try again
-        stdout = check_output(['vagrant', 'ssh-config'],
-                              cwd=target.path)
+        out = subprocess.check_output(['vagrant', 'ssh-config'],
+                                      cwd=target.path)
 
-    info = {}
-    for line in stdout.split(b'\n'):
+    vagrant_info = {}
+    for line in out.split(b'\n'):
         line = line.strip().split(b' ', 1)
         if len(line) != 2:
             continue
-        info[line[0].decode('utf-8').lower()] = line[1].decode('utf-8')
+        value = line[1].decode('utf-8')
+        if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+            # Vagrant should really be escaping special characters here, but
+            # it's not -- https://github.com/mitchellh/vagrant/issues/6428
+            value = value[1:-1]
+        vagrant_info[line[0].decode('utf-8').lower()] = value
 
-    if 'identityfile' in info:
-        key_file = info['identityfile']
+    if 'identityfile' in vagrant_info:
+        key_file = vagrant_info['identityfile']
     else:
         key_file = Path('~/.vagrant.d/insecure_private_key').expand_user()
-    ret = dict(hostname=info.get('hostname', '127.0.0.1'),
-               port=int(info.get('port', 2222)),
-               username=info.get('user', 'vagrant'),
-               key_filename=key_file)
+    info = dict(hostname=vagrant_info.get('hostname', '127.0.0.1'),
+                port=int(vagrant_info.get('port', 2222)),
+                username=vagrant_info.get('user', 'vagrant'),
+                key_filename=key_file)
     logging.debug("SSH parameters from Vagrant: %s@%s:%s, key=%s",
-                  ret['username'], ret['hostname'], ret['port'],
-                  ret['key_filename'])
-    return ret
+                  info['username'], info['hostname'], info['port'],
+                  info['key_filename'])
+
+    unpacked_info = read_dict(target)
+    use_chroot = unpacked_info['use_chroot']
+    gui = unpacked_info['gui']
+
+    if use_chroot:
+        # Mount directories
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(IgnoreMissingKey())
+        ssh.connect(**info)
+        chan = ssh.get_transport().open_session()
+        chan.exec_command(
+            '/usr/bin/sudo /bin/sh -c %s' % shell_escape(
+                'for i in dev proc; do '
+                'if ! grep "^/experimentroot/$i$" /proc/mounts; then '
+                'mount -o rbind /$i /experimentroot/$i; '
+                'fi; '
+                'done'))
+        if chan.recv_exit_status() != 0:
+            logging.critical("Couldn't mount directories in chroot")
+            sys.exit(1)
+        if gui:
+            # Mount X11 socket
+            chan = ssh.get_transport().open_session()
+            chan.exec_command(
+                '/usr/bin/sudo /bin/sh -c %s' % shell_escape(
+                    'if [ -d /tmp/.X11-unix ]; then '
+                    '[ -d /experimentroot/tmp/.X11-unix ] || '
+                    'mkdir /experimentroot/tmp/.X11-unix; '
+                    'mount -o bind '
+                    '/tmp/.X11-unix /experimentroot/tmp/.X11-unix; '
+                    'fi; exit 0'))
+            if chan.recv_exit_status() != 0:
+                logging.critical("Couldn't mount X11 sockets in chroot")
+                sys.exit(1)
+        ssh.close()
+
+    return info
 
 
 def vagrant_setup_create(args):
@@ -182,21 +218,31 @@ def vagrant_setup_create(args):
     signals.pre_setup(target=target, pack=pack)
 
     # Unpacks configuration file
-    tar = tarfile.open(str(pack), 'r:*')
-    member = tar.getmember('METADATA/config.yml')
-    member.name = 'config.yml'
-    tar.extract(member, str(target))
-    tar.close()
+    rpz_pack = RPZPack(pack)
+    rpz_pack.extract_config(target / 'config.yml')
 
     # Loads config
-    runs, packages, other_files = load_config(target / 'config.yml', True)
+    runs, packages, other_files = config = load_config(target / 'config.yml',
+                                                       True)
+
+    if not args.memory:
+        memory = None
+    else:
+        try:
+            memory = int(args.memory[-1])
+        except ValueError:
+            logging.critical("Invalid value for memory size: %r", args.memory)
+            sys.exit(1)
 
     if args.base_image and args.base_image[0]:
         record_usage(vagrant_explicit_image=True)
-        target_distribution = None
         box = args.base_image[0]
+        if args.distribution:
+            target_distribution = args.distribution[0]
+        else:
+            target_distribution = None
     else:
-        target_distribution, box = select_box(runs)
+        target_distribution, box = select_box(runs, gui=args.gui)
     logging.info("Using box %s", box)
     logging.debug("Distribution: %s", target_distribution or "unknown")
 
@@ -212,116 +258,142 @@ def vagrant_setup_create(args):
                          ' '.join(pkg.name for pkg in packages))
 
     if packages:
-        installer = select_installer(pack, runs, target_distribution)
+        try:
+            installer = select_installer(pack, runs, target_distribution)
+        except CantFindInstaller as e:
+            logging.error("Need to install %d packages but couldn't select a "
+                          "package installer: %s",
+                          len(packages), e)
 
     target.mkdir(parents=True)
 
-    # Writes setup script
-    logging.info("Writing setup script %s...", target / 'setup.sh')
-    with (target / 'setup.sh').open('w', encoding='utf-8', newline='\n') as fp:
-        fp.write('#!/bin/sh\n\nset -e\n\n')
-        if packages:
-            # Updates package sources
-            fp.write(installer.update_script())
-            fp.write('\n')
-            # Installs necessary packages
-            fp.write(installer.install_script(packages))
-            fp.write('\n')
-            # TODO : Compare package versions (painful because of sh)
+    try:
+        # Writes setup script
+        logging.info("Writing setup script %s...", target / 'setup.sh')
+        with (target / 'setup.sh').open('w', encoding='utf-8',
+                                        newline='\n') as fp:
+            fp.write('#!/bin/sh\n\nset -e\n\n')
+            if packages:
+                # Updates package sources
+                update_script = installer.update_script()
+                if update_script:
+                    fp.write(update_script)
+                fp.write('\n')
+                # Installs necessary packages
+                fp.write(installer.install_script(packages))
+                fp.write('\n')
+                # TODO : Compare package versions (painful because of sh)
 
-        # Untar
-        if use_chroot:
-            fp.write('\n'
-                     'mkdir /experimentroot; cd /experimentroot\n')
-            fp.write('tar zpxf /vagrant/experiment.rpz '
-                     '--numeric-owner --strip=1 DATA\n')
-            if mount_bind:
+            # Untar
+            if use_chroot:
                 fp.write('\n'
-                         'mkdir -p /experimentroot/dev\n'
-                         'mount -o rbind /dev /experimentroot/dev\n'
-                         'mkdir -p /experimentroot/proc\n'
-                         'mount -o rbind /proc /experimentroot/proc\n')
+                         'mkdir /experimentroot; cd /experimentroot\n')
+                fp.write('tar zpxf /vagrant/data.tgz --numeric-owner '
+                         '--strip=1 %s\n' % rpz_pack.data_prefix)
+                if mount_bind:
+                    fp.write('\n'
+                             'mkdir -p /experimentroot/dev\n'
+                             'mkdir -p /experimentroot/proc\n')
 
-            for pkg in packages:
-                fp.write('\n# Copies files from package %s\n' % pkg.name)
-                for f in pkg.files:
-                    f = f.path
-                    dest = join_root(PosixPath('/experimentroot'), f)
-                    fp.write('mkdir -p %s\n' %
-                             shell_escape(unicode_(f.parent)))
-                    fp.write('cp -L %s %s\n' % (
-                             shell_escape(unicode_(f)),
-                             shell_escape(unicode_(dest))))
-        else:
-            fp.write('\ncd /\n')
-            paths = set()
-            pathlist = []
-            dataroot = PosixPath('DATA')
-            # Adds intermediate directories, and checks for existence in the
-            # tar
-            tar = tarfile.open(str(pack), 'r:*')
-            for f in other_files:
-                path = PosixPath('/')
-                for c in f.path.components[1:]:
-                    path = path / c
-                    if path in paths:
-                        continue
-                    paths.add(path)
-                    datapath = join_root(dataroot, path)
-                    try:
-                        tar.getmember(str(datapath))
-                    except KeyError:
-                        logging.info("Missing file %s", datapath)
-                    else:
-                        pathlist.append(unicode_(datapath))
-            tar.close()
-            # FIXME : for some reason we need reversed() here, I'm not sure
-            # why. Need to read more of tar's docs.
-            # TAR bug: --no-overwrite-dir removes --keep-old-files
-            fp.write('tar zpxf /vagrant/experiment.rpz --keep-old-files '
-                     '--numeric-owner --strip=1 %s\n' %
-                     ' '.join(shell_escape(p) for p in reversed(pathlist)))
+                for pkg in packages:
+                    fp.write('\n# Copies files from package %s\n' % pkg.name)
+                    for f in pkg.files:
+                        f = f.path
+                        dest = join_root(PosixPath('/experimentroot'), f)
+                        fp.write('mkdir -p %s\n' %
+                                 shell_escape(unicode_(f.parent)))
+                        fp.write('cp -L %s %s\n' % (
+                                 shell_escape(unicode_(f)),
+                                 shell_escape(unicode_(dest))))
+            else:
+                fp.write('\ncd /\n')
+                paths = set()
+                pathlist = []
+                # Adds intermediate directories, and checks for existence in
+                # the tar
+                data_files = rpz_pack.data_filenames()
+                for f in other_files:
+                    path = PosixPath('/')
+                    for c in rpz_pack.remove_data_prefix(f.path).components:
+                        path = path / c
+                        if path in paths:
+                            continue
+                        paths.add(path)
+                        if path in data_files:
+                            pathlist.append(path)
+                        else:
+                            logging.info("Missing file %s", path)
+                # FIXME : for some reason we need reversed() here, I'm not sure
+                # why. Need to read more of tar's docs.
+                # TAR bug: --no-overwrite-dir removes --keep-old-files
+                # TAR bug: there is no way to make --keep-old-files not report
+                # an error if an existing file is encountered. --skip-old-files
+                # was introduced too recently. Instead, we just ignore the exit
+                # status
+                with (target / 'rpz-files.list').open('wb') as lfp:
+                    for p in reversed(pathlist):
+                        lfp.write(join_root(rpz_pack.data_prefix, p).path)
+                        lfp.write(b'\0')
+                fp.write('tar zpxf /vagrant/data.tgz --keep-old-files '
+                         '--numeric-owner --strip=1 '
+                         '--null -T /vagrant/rpz-files.list || /bin/true\n')
 
-        # Copies /bin/sh + dependencies
-        if use_chroot:
-            url = busybox_url(runs[0]['architecture'])
-            fp.write(r'''
+            # Copies busybox
+            if use_chroot:
+                arch = runs[0]['architecture']
+                download_file(busybox_url(arch),
+                              target / 'busybox',
+                              'busybox-%s' % arch)
+                fp.write(r'''
+cp /vagrant/busybox /experimentroot/busybox
+chmod +x /experimentroot/busybox
 mkdir -p /experimentroot/bin
-mkdir -p /experimentroot/usr/bin
-if [ ! -e /experimentroot/bin/sh -o ! -e /experimentroot/usr/bin/env ]; then
-    wget --quiet -O /experimentroot/bin/busybox {url}
-    chmod +x /experimentroot/bin/busybox
-fi
 [ -e /experimentroot/bin/sh ] || \
-    ln -s /bin/busybox /experimentroot/bin/sh
-[ -e /experimentroot/usr/bin/env ] || \
-    ln -s /bin/busybox /experimentroot/usr/bin/env
-'''.format(url=url))
+    ln -s /busybox /experimentroot/bin/sh
+''')
 
-    # Copies pack
-    logging.info("Copying pack file...")
-    pack.copyfile(target / 'experiment.rpz')
+        # Copies pack
+        logging.info("Copying pack file...")
+        rpz_pack.copy_data_tar(target / 'data.tgz')
 
-    # Writes Vagrant file
-    logging.info("Writing %s...", target / 'Vagrantfile')
-    with (target / 'Vagrantfile').open('w', encoding='utf-8',
-                                       newline='\n') as fp:
-        # Vagrant header and version
-        fp.write('# -*- mode: ruby -*-\n'
-                 '# vi: set ft=ruby\n\n'
-                 'VAGRANTFILE_API_VERSION = "2"\n\n'
-                 'Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|\n')
-        # Selects which box to install
-        fp.write('  config.vm.box = "%s"\n' % box)
-        # Run the setup script on the virtual machine
-        fp.write('  config.vm.provision "shell", path: "setup.sh"\n')
+        rpz_pack.close()
 
-        fp.write('end\n')
+        # Writes Vagrant file
+        logging.info("Writing %s...", target / 'Vagrantfile')
+        with (target / 'Vagrantfile').open('w', encoding='utf-8',
+                                           newline='\n') as fp:
+            # Vagrant header and version
+            fp.write(
+                '# -*- mode: ruby -*-\n'
+                '# vi: set ft=ruby\n\n'
+                'VAGRANTFILE_API_VERSION = "2"\n\n'
+                'Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|\n')
+            # Selects which box to install
+            fp.write('  config.vm.box = "%s"\n' % box)
+            # Run the setup script on the virtual machine
+            fp.write('  config.vm.provision "shell", path: "setup.sh"\n')
 
-    # Meta-data for reprounzip
-    write_dict(target / '.reprounzip', {'use_chroot': use_chroot})
+            # Memory size
+            if memory is not None or args.gui:
+                fp.write('  config.vm.provider "virtualbox" do |v|\n')
+                if memory is not None:
+                    fp.write('    v.memory = %d\n' % memory)
+                if args.gui:
+                    fp.write('    v.gui = true\n')
+                fp.write('  end\n')
 
-    signals.post_setup(target=target)
+            fp.write('end\n')
+
+        # Meta-data for reprounzip
+        write_dict(target,
+                   metadata_initial_iofiles(config,
+                                            {'use_chroot': use_chroot,
+                                             'gui': args.gui}))
+
+        signals.post_setup(target=target, pack=pack)
+    except Exception:
+        target.rmtree(ignore_errors=True)
+        raise
 
 
 @target_must_exist
@@ -329,86 +401,24 @@ def vagrant_setup_start(args):
     """Starts the vagrant-built virtual machine.
     """
     target = Path(args.target[0])
-    read_dict(target / '.reprounzip')
 
-    logging.info("Calling 'vagrant up'...")
-    try:
-        retcode = subprocess.call(['vagrant', 'up'], cwd=target.path)
-    except OSError:
-        logging.critical("vagrant executable not found")
-        sys.exit(1)
-    else:
-        if retcode != 0:
-            logging.critical("vagrant up failed with code %d", retcode)
-            sys.exit(1)
+    check_vagrant_version()
+
+    machine_setup(target)
 
 
-def find_ssh_executable(name='ssh'):
-    exts = os.environ.get('PATHEXT', '').split(os.pathsep)
-    dirs = list(os.environ.get('PATH', '').split(os.pathsep))
-    par, join = os.path.dirname, os.path.join
-    # executable might be bin/python or ReproUnzip\python
-    # or ReproUnzip\Python27\python or ReproUnzip\Python27\Scripts\something
-    loc = par(sys.executable)
-    local_dirs = []
-    for i in irange(3):
-        local_dirs.extend([loc, join(loc, 'ssh')])
-        loc = par(loc)
-    for pathdir in local_dirs + dirs:
-        for ext in exts:
-            fullpath = os.path.join(pathdir, name + ext)
-            if os.path.isfile(fullpath):
-                return fullpath
-    return None
+class LocalX11Handler(BaseX11Handler):
+    port_forward = []
+    init_cmds = []
 
-
-def run_interactive(ssh_info, interactive, cmds, request_pty):
-    if interactive:
-        ssh_exe = find_ssh_executable()
-    else:
-        ssh_exe = None
-
-    if interactive and ssh_exe:
-        record_usage(vagrant_ssh='ssh')
-        return subprocess.call(
-                [ssh_exe,
-                 '-t' if request_pty else '-T',  # Force allocation of PTY
-                 '-o', 'StrictHostKeyChecking=no',  # Silently accept host keys
-                 '-o', 'UserKnownHostsFile=/dev/null',  # Don't store host keys
-                 '-i', ssh_info['key_filename'],
-                 '-p', '%d' % ssh_info['port'],
-                 '%s@%s' % (ssh_info['username'],
-                            ssh_info['hostname']),
-                 cmds])
-    else:
-        record_usage(vagrant_ssh='interactive' if interactive else 'simple')
-        # Connects to the machine
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(IgnoreMissingKey())
-        ssh.connect(**ssh_info)
-
-        chan = ssh.get_transport().open_session()
-        if request_pty:
-            chan.get_pty()
-
-        # Execute command
-        logging.info("Connected via SSH, running command...")
-        chan.exec_command(cmds)
-
-        # Get output
-        if interactive:
-            interactive_shell(chan)
-        else:
-            chan.shutdown_write()
-            while True:
-                data = chan.recv(1024)
-                if len(data) == 0:
-                    break
-                sys.stdout.buffer.write(data)
-                sys.stdout.flush()
-        retcode = chan.recv_exit_status()
-        ssh.close()
-        return retcode
+    @staticmethod
+    def fix_env(env):
+        """Sets ``$XAUTHORITY`` and ``$DISPLAY`` in the environment.
+        """
+        new_env = dict(env)
+        new_env.pop('XAUTHORITY', None)
+        new_env['DISPLAY'] = ':0'
+        return new_env
 
 
 @target_must_exist
@@ -416,21 +426,38 @@ def vagrant_run(args):
     """Runs the experiment in the virtual machine.
     """
     target = Path(args.target[0])
-    use_chroot = read_dict(target / '.reprounzip').get('use_chroot', True)
+    unpacked_info = read_dict(target)
+    use_chroot = unpacked_info['use_chroot']
     cmdline = args.cmdline
 
+    check_vagrant_version()
+
     # Loads config
-    runs, packages, other_files = load_config(target / 'config.yml', True)
+    config = load_config(target / 'config.yml', True)
+    runs = config.runs
 
     selected_runs = get_runs(runs, args.run, cmdline)
+
+    hostname = runs[selected_runs[0]].get('hostname', 'reprounzip')
+
+    # X11 handler
+    if unpacked_info['gui']:
+        x11 = LocalX11Handler()
+    else:
+        x11 = X11Handler(args.x11, ('local', hostname), args.x11_display)
 
     cmds = []
     for run_number in selected_runs:
         run = runs[run_number]
         cmd = 'cd %s && ' % shell_escape(run['workingdir'])
-        cmd += '/usr/bin/env -i '
-        cmd += ' '.join('%s=%s' % (k, shell_escape(v))
-                        for k, v in iteritems(run['environ']))
+        if use_chroot:
+            cmd += '/busybox env -i '
+        else:
+            cmd += '/usr/bin/env -i '
+        environ = x11.fix_env(run['environ'])
+        environ = fixup_environment(environ, args)
+        cmd += ' '.join('%s=%s' % (shell_escape(k), shell_escape(v))
+                        for k, v in iteritems(environ))
         cmd += ' '
         # FIXME : Use exec -a or something if binary != argv[0]
         if cmdline is None:
@@ -449,11 +476,23 @@ def vagrant_run(args):
         else:
             cmd = 'sudo -u \'#%d\' sh -c %s' % (uid, shell_escape(cmd))
         cmds.append(cmd)
+    if use_chroot:
+        cmds = ['chroot /experimentroot /bin/sh -c %s' % shell_escape(c)
+                for c in x11.init_cmds] + cmds
+    else:
+        cmds = x11.init_cmds + cmds
     cmds = ' && '.join(cmds)
+    # Sets the hostname to the original experiment's machine's
+    # FIXME: not reentrant: this restores the Vagrant machine's hostname after
+    # the run, which might cause issues if several "reprounzip vagrant run" are
+    # running at once
+    cmds = ('OLD_HOSTNAME=$(/bin/hostname); /bin/hostname %s; ' % hostname +
+            cmds +
+            '; RES=$?; /bin/hostname "$OLD_HOSTNAME"; exit $RES')
     cmds = '/usr/bin/sudo /bin/sh -c %s' % shell_escape(cmds)
 
     # Gets vagrant SSH parameters
-    info = get_ssh_parameters(target)
+    info = machine_setup(target)
 
     signals.pre_run(target=target)
 
@@ -461,9 +500,13 @@ def vagrant_run(args):
                        os.environ.get('REPROUNZIP_NON_INTERACTIVE'))
     retcode = run_interactive(info, interactive,
                               cmds,
-                              not args.no_pty)
-    sys.stderr.write("\r\n*** Command finished, status: %d\r\n" %
-                     retcode)
+                              not args.no_pty,
+                              x11.port_forward)
+    stderr.write("\r\n*** Command finished, status: %d\r\n" % retcode)
+
+    # Update input file status
+    metadata_update_run(config, unpacked_info, selected_runs)
+    write_dict(target, unpacked_info)
 
     signals.post_run(target=target, retcode=retcode)
 
@@ -476,46 +519,52 @@ class SSHUploader(FileUploader):
     def prepare_upload(self, files):
         # Checks whether the VM is running
         try:
-            ssh_info = get_ssh_parameters(self.target)
+            ssh_info = machine_setup(self.target)
         except subprocess.CalledProcessError:
             logging.critical("Failed to get the status of the machine -- is "
                              "it running?")
             sys.exit(1)
 
-        # Connect with scp
+        # Connect with SSH
         self.ssh = paramiko.SSHClient()
         self.ssh.set_missing_host_key_policy(IgnoreMissingKey())
         self.ssh.connect(**ssh_info)
-        self.client_scp = scp.SCPClient(self.ssh.get_transport())
 
     def upload_file(self, local_path, input_path):
         if self.use_chroot:
             remote_path = join_root(PosixPath('/experimentroot'),
-                                    PosixPath(input_path))
+                                    input_path)
         else:
             remote_path = input_path
 
-        # Upload to a temporary file first
-        logging.info("Uploading file via SCP...")
-        rtemp = PosixPath(make_unique_name(b'/tmp/reprozip_input_'))
-        self.client_scp.put(local_path.path, rtemp.path, recursive=False)
+        temp = make_unique_name(b'reprozip_input_')
+        ltemp = self.target / temp
+        rtemp = PosixPath('/vagrant') / temp
+
+        # Copy file to shared folder
+        logging.info("Copying file to shared folder...")
+        local_path.copyfile(ltemp)
 
         # Move it
         logging.info("Moving file into place...")
         chan = self.ssh.get_transport().open_session()
         chown_cmd = '/bin/chown --reference=%s %s' % (
-                shell_escape(remote_path.path),
-                shell_escape(rtemp.path))
+            shell_escape(remote_path.path),
+            shell_escape(rtemp.path))
         chmod_cmd = '/bin/chmod --reference=%s %s' % (
-                shell_escape(remote_path.path),
-                shell_escape(rtemp.path))
+            shell_escape(remote_path.path),
+            shell_escape(rtemp.path))
         mv_cmd = '/bin/mv %s %s' % (
-                shell_escape(rtemp.path),
-                shell_escape(remote_path.path))
+            shell_escape(rtemp.path),
+            shell_escape(remote_path.path))
         chan.exec_command('/usr/bin/sudo /bin/sh -c %s' % shell_escape(
-                          ';'.join((chown_cmd, chmod_cmd, mv_cmd))))
+                          ' && '.join((chown_cmd, chmod_cmd, mv_cmd))))
         if chan.recv_exit_status() != 0:
             logging.critical("Couldn't move file in virtual machine")
+            try:
+                ltemp.remove()
+            except OSError:
+                pass
             sys.exit(1)
         chan.close()
 
@@ -529,46 +578,70 @@ def vagrant_upload(args):
     """
     target = Path(args.target[0])
     files = args.file
-    unpacked_info = read_dict(target / '.reprounzip')
+    unpacked_info = read_dict(target)
     input_files = unpacked_info.setdefault('input_files', {})
     use_chroot = unpacked_info['use_chroot']
 
     try:
         SSHUploader(target, input_files, files, use_chroot)
     finally:
-        write_dict(target / '.reprounzip', unpacked_info)
+        write_dict(target, unpacked_info)
 
 
 class SSHDownloader(FileDownloader):
-    def __init__(self, target, files, use_chroot):
+    def __init__(self, target, files, use_chroot, all_=False):
         self.use_chroot = use_chroot
-        FileDownloader.__init__(self, target, files)
+        FileDownloader.__init__(self, target, files, all_=all_)
 
     def prepare_download(self, files):
         # Checks whether the VM is running
         try:
-            info = get_ssh_parameters(self.target)
+            info = machine_setup(self.target)
         except subprocess.CalledProcessError:
             logging.critical("Failed to get the status of the machine -- is "
                              "it running?")
             sys.exit(1)
 
-        # Connect with scp
+        # Connect with SSH
         self.ssh = paramiko.SSHClient()
         self.ssh.set_missing_host_key_policy(IgnoreMissingKey())
         self.ssh.connect(**info)
-        self.client_scp = scp.SCPClient(self.ssh.get_transport())
 
     def download(self, remote_path, local_path):
         if self.use_chroot:
             remote_path = join_root(PosixPath('/experimentroot'), remote_path)
+
+        temp = make_unique_name(b'reprozip_output_')
+        rtemp = PosixPath('/vagrant') / temp
+        ltemp = self.target / temp
+
+        # Copy file to shared folder
+        logging.info("Copying file to shared folder...")
+        chan = self.ssh.get_transport().open_session()
+        cp_cmd = '/bin/cp %s %s' % (
+            shell_escape(remote_path.path),
+            shell_escape(rtemp.path))
+        chown_cmd = '/bin/chown vagrant %s' % shell_escape(rtemp.path)
+        chmod_cmd = '/bin/chmod 644 %s' % shell_escape(rtemp.path)
+        chan.exec_command('/usr/bin/sudo /bin/sh -c %s' % shell_escape(
+            ' && '.join((cp_cmd, chown_cmd, chmod_cmd))))
+        if chan.recv_exit_status() != 0:
+            logging.critical("Couldn't copy file in virtual machine")
+            try:
+                ltemp.remove()
+            except OSError:
+                pass
+            return False
+
+        # Move file to final destination
         try:
-            self.client_scp.get(remote_path.path, local_path.path,
-                                recursive=False)
-        except scp.SCPException as e:
+            ltemp.rename(local_path)
+        except OSError as e:
             logging.critical("Couldn't download output file: %s\n%s",
                              remote_path, str(e))
-            sys.exit(1)
+            ltemp.remove()
+            return False
+        return True
 
     def finalize(self):
         self.ssh.close()
@@ -580,9 +653,21 @@ def vagrant_download(args):
     """
     target = Path(args.target[0])
     files = args.file
-    use_chroot = read_dict(target / '.reprounzip')['use_chroot']
+    use_chroot = read_dict(target)['use_chroot']
 
-    SSHDownloader(target, files, use_chroot)
+    SSHDownloader(target, files, use_chroot, all_=args.all)
+
+
+@target_must_exist
+def vagrant_suspend(args):
+    """Suspends the VM through Vagrant, without destroying it.
+    """
+    target = Path(args.target[0])
+
+    retcode = subprocess.call(['vagrant', 'suspend'], cwd=target.path)
+    if retcode != 0:
+        logging.critical("vagrant suspend failed with code %d, ignoring...",
+                         retcode)
 
 
 @target_must_exist
@@ -590,7 +675,7 @@ def vagrant_destroy_vm(args):
     """Destroys the VM through Vagrant.
     """
     target = Path(args.target[0])
-    read_dict(target / '.reprounzip')
+    read_dict(target)
 
     retcode = subprocess.call(['vagrant', 'destroy', '-f'], cwd=target.path)
     if retcode != 0:
@@ -603,24 +688,61 @@ def vagrant_destroy_dir(args):
     """Destroys the directory.
     """
     target = Path(args.target[0])
-    read_dict(target / '.reprounzip')
+    read_dict(target)
 
     signals.pre_destroy(target=target)
     target.rmtree()
     signals.post_destroy(target=target)
 
 
-def test_has_vagrant(pack, **kwargs):
-    """Compatibility test: has vagrant (ok) or not (maybe).
-    """
+def _executable_in_path(executable):
     pathlist = os.environ['PATH'].split(os.pathsep) + ['.']
     pathexts = os.environ.get('PATHEXT', '').split(os.pathsep)
     for path in pathlist:
         for ext in pathexts:
-            fullpath = os.path.join(path, 'vagrant') + ext
+            fullpath = os.path.join(path, executable) + ext
             if os.path.isfile(fullpath):
-                return COMPAT_OK
-    return COMPAT_MAYBE, "vagrant not found in PATH"
+                return True
+    return False
+
+
+def check_vagrant_version():
+    try:
+        out = subprocess.check_output(['vagrant', '--version'])
+    except (subprocess.CalledProcessError, OSError):
+        logging.error("Couldn't run vagrant")
+        sys.exit(1)
+    out = out.decode('ascii').strip().lower().split()
+    if out[0] == 'vagrant':
+        if LooseVersion(out[1]) < LooseVersion('1.1'):
+            logging.error("Vagrant >=1.1 is required; detected version: %s",
+                          out[1])
+            sys.exit(1)
+    else:
+        logging.error("Vagrant >=1.1 is required")
+        sys.exit(1)
+
+
+def test_has_vagrant(pack, **kwargs):
+    """Compatibility test: has vagrant (ok) or not (maybe).
+    """
+    if not _executable_in_path('vagrant'):
+        return COMPAT_MAYBE, "vagrant not found in PATH"
+
+    try:
+        out = subprocess.check_output(['vagrant', '--version'])
+    except subprocess.CalledProcessError:
+        return COMPAT_NO, ("vagrant was found in PATH but doesn't seem to "
+                           "work properly")
+    out = out.decode('ascii').strip().lower().split()
+    if out[0] == 'vagrant':
+        if LooseVersion(out[1]) >= LooseVersion('1.1'):
+            return COMPAT_OK
+        else:
+            return COMPAT_NO, ("Vagrant >=1.1 is required; detected version: "
+                               "%s" % out[1])
+    else:
+        return COMPAT_NO, "Vagrant >=1.1 is required"
 
 
 def setup(parser, **kwargs):
@@ -659,80 +781,113 @@ def setup(parser, **kwargs):
     """
     subparsers = parser.add_subparsers(title="actions",
                                        metavar='', help=argparse.SUPPRESS)
-    options = argparse.ArgumentParser(add_help=False)
-    options.add_argument('target', nargs=1, help="Experiment directory")
+
+    def add_opt_general(opts):
+        opts.add_argument('target', nargs=1, help="Experiment directory")
 
     # setup/create
-    opt_setup = argparse.ArgumentParser(add_help=False)
-    opt_setup.add_argument('pack', nargs=1, help="Pack to extract")
-    opt_setup.add_argument(
+    def add_opt_setup(opts):
+        opts.add_argument('pack', nargs=1, help="Pack to extract")
+        opts.add_argument(
             '--use-chroot', action='store_true',
             default=True,
             help=argparse.SUPPRESS)
-    opt_setup.add_argument(
+        opts.add_argument(
             '--dont-use-chroot', action='store_false', dest='use_chroot',
             default=True,
-            help=("Don't prefer original files nor use chroot in the virtual "
-                  "machine"))
-    opt_setup.add_argument(
+            help="Don't prefer original files nor use chroot in the virtual "
+                 "machine")
+        opts.add_argument(
             '--no-use-chroot', action='store_false', dest='use_chroot',
             default=True, help=argparse.SUPPRESS)
-    opt_setup.add_argument(
+        opts.add_argument(
             '--dont-bind-magic-dirs', action='store_false', default=True,
             dest='bind_magic_dirs',
             help="Don't mount /dev and /proc inside the chroot (no effect if "
             "--dont-use-chroot is set)")
-    opt_setup.add_argument('--base-image', nargs=1, help="Vagrant box to use")
-    parser_setup_create = subparsers.add_parser('setup/create',
-                                                parents=[opt_setup, options])
+        opts.add_argument('--base-image', nargs=1, help="Vagrant box to use")
+        opts.add_argument('--distribution', nargs=1,
+                          help="Distribution used in the Vagrant box (for "
+                               "package installer selection)")
+        opts.add_argument('--memory', nargs=1,
+                          help="Amount of RAM to allocate to VM (megabytes, "
+                               "default: box default)")
+        opts.add_argument('--use-gui', action='store_true', default=False,
+                          dest='gui', help="Use the VM's X server")
+
+    parser_setup_create = subparsers.add_parser('setup/create')
+    add_opt_setup(parser_setup_create)
+    add_opt_general(parser_setup_create)
     parser_setup_create.set_defaults(func=vagrant_setup_create)
 
     # setup/start
-    parser_setup_start = subparsers.add_parser('setup/start',
-                                               parents=[options])
+    parser_setup_start = subparsers.add_parser('setup/start')
+    add_opt_general(parser_setup_start)
     parser_setup_start.set_defaults(func=vagrant_setup_start)
 
     # setup
-    parser_setup = subparsers.add_parser('setup', parents=[opt_setup, options])
+    parser_setup = subparsers.add_parser('setup')
+    add_opt_setup(parser_setup)
+    add_opt_general(parser_setup)
     parser_setup.set_defaults(func=composite_action(vagrant_setup_create,
                                                     vagrant_setup_start))
 
     # upload
-    parser_upload = subparsers.add_parser('upload', parents=[options])
+    parser_upload = subparsers.add_parser('upload')
+    add_opt_general(parser_upload)
     parser_upload.add_argument('file', nargs=argparse.ZERO_OR_MORE,
                                help="<path>:<input_file_name")
     parser_upload.set_defaults(func=vagrant_upload)
 
     # run
-    parser_run = subparsers.add_parser('run', parents=[options])
-    parser_run.add_argument('run', default=None, nargs='?')
+    parser_run = subparsers.add_parser('run')
+    add_opt_general(parser_run)
+    parser_run.add_argument('run', default=None, nargs=argparse.OPTIONAL)
     parser_run.add_argument('--no-stdin', action='store_true', default=False,
-                            help=("Don't connect program's input stream to "
-                                  "this terminal"))
+                            help="Don't connect program's input stream to "
+                                 "this terminal")
     parser_run.add_argument('--no-pty', action='store_true', default=False,
                             help="Don't request a PTY from the SSH server")
     parser_run.add_argument('--cmdline', nargs=argparse.REMAINDER,
                             help="Command line to run")
+    parser_run.add_argument('--enable-x11', action='store_true', default=False,
+                            dest='x11',
+                            help="Enable X11 support (needs an X server on "
+                                 "the host)")
+    parser_run.add_argument('--x11-display', dest='x11_display',
+                            help="Display number to use on the experiment "
+                                 "side (change the host display with the "
+                                 "DISPLAY environment variable)")
+    add_environment_options(parser_run)
     parser_run.set_defaults(func=vagrant_run)
 
     # download
-    parser_download = subparsers.add_parser('download', parents=[options])
+    parser_download = subparsers.add_parser('download')
+    add_opt_general(parser_download)
     parser_download.add_argument('file', nargs=argparse.ZERO_OR_MORE,
-                                 help="<output_file_name>:<path>")
+                                 help="<output_file_name>[:<path>]")
+    parser_download.add_argument('--all', action='store_true',
+                                 help="Download all output files to the "
+                                      "current directory")
     parser_download.set_defaults(func=vagrant_download)
 
+    parser_suspend = subparsers.add_parser('suspend')
+    add_opt_general(parser_suspend)
+    parser_suspend.set_defaults(func=vagrant_suspend)
+
     # destroy/vm
-    parser_destroy_vm = subparsers.add_parser('destroy/vm',
-                                              parents=[options])
+    parser_destroy_vm = subparsers.add_parser('destroy/vm')
+    add_opt_general(parser_destroy_vm)
     parser_destroy_vm.set_defaults(func=vagrant_destroy_vm)
 
     # destroy/dir
-    parser_destroy_dir = subparsers.add_parser('destroy/dir',
-                                               parents=[options])
+    parser_destroy_dir = subparsers.add_parser('destroy/dir')
+    add_opt_general(parser_destroy_dir)
     parser_destroy_dir.set_defaults(func=vagrant_destroy_dir)
 
     # destroy
-    parser_destroy = subparsers.add_parser('destroy', parents=[options])
+    parser_destroy = subparsers.add_parser('destroy')
+    add_opt_general(parser_destroy)
     parser_destroy.set_defaults(func=composite_action(vagrant_destroy_vm,
                                                       vagrant_destroy_dir))
 

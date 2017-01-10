@@ -1,4 +1,4 @@
-# Copyright (C) 2014 New York University
+# Copyright (C) 2014-2016 New York University
 # This file is part of ReproZip which is released under the Revised BSD License
 # See file LICENSE for full license details.
 
@@ -9,28 +9,33 @@ invokes the C tracer (_pytracer) to build the SQLite trace file, and the
 generation logic for the config YAML file.
 """
 
-from __future__ import unicode_literals
+from __future__ import division, print_function, unicode_literals
 
-import heapq
+from collections import defaultdict
+from itertools import count
 import logging
 import os
+from pkg_resources import iter_entry_points
 import platform
 from rpaths import Path
 import sqlite3
+import sys
 
 from reprozip import __version__ as reprozip_version
 from reprozip import _pytracer
-from reprozip.common import File, load_config, save_config, \
-    FILE_READ, FILE_WRITE, FILE_WDIR
-from reprozip.orderedset import OrderedSet
+from reprozip.common import File, InputOutputFile, load_config, save_config, \
+    FILE_READ, FILE_WRITE, FILE_LINK
 from reprozip.tracer.linux_pkgs import magic_dirs, system_dirs, \
     identify_packages
-from reprozip.utils import PY3, izip, itervalues, listvalues, unicode_, \
-    hsize, find_all_links
+from reprozip.utils import PY3, izip, iteritems, itervalues, \
+    unicode_, flatten, UniqueNames, hsize, normalize_path, find_all_links
 
 
 class TracedFile(File):
     """Override of `~reprozip.common.File` that reads stats from filesystem.
+
+    It also memorizes how files are used, to select files that are only read,
+    and accurately guess input and output files.
     """
     #                               read
     #                              +------+
@@ -61,17 +66,38 @@ class TracedFile(File):
             else:
                 size = path.size()
                 self.comment = hsize(size)
+        self.what = None
+        self.runs = defaultdict(lambda: None)
         File.__init__(self, path, size)
 
-    def read(self):
+    def read(self, run):
         if self.what is None:
             self.what = TracedFile.ONLY_READ
 
-    def write(self):
+        if run is not None:
+            if self.runs[run] is None:
+                self.runs[run] = TracedFile.ONLY_READ
+
+    def write(self, run):
         if self.what is None:
             self.what = TracedFile.WRITTEN
         elif self.what == TracedFile.ONLY_READ:
             self.what = TracedFile.READ_THEN_WRITTEN
+
+        if run is not None:
+            if self.runs[run] is None:
+                self.runs[run] = TracedFile.WRITTEN
+            elif self.runs[run] == TracedFile.ONLY_READ:
+                self.runs[run] = TracedFile.READ_THEN_WRITTEN
+
+
+def run_filter_plugins(files, input_files):
+    for entry_point in iter_entry_points('reprozip.filters'):
+        func = entry_point.load()
+        name = entry_point.name
+
+        logging.info("Running filter plugin %s", name)
+        func(files=files, input_files=input_files)
 
 
 def get_files(conn):
@@ -83,12 +109,12 @@ def get_files(conn):
     # Finds run timestamps, so we can sort input/output files by run
     proc_cursor = conn.cursor()
     executions = proc_cursor.execute(
-            '''
-            SELECT timestamp
-            FROM processes
-            WHERE parent ISNULL
-            ORDER BY id;
-            ''')
+        '''
+        SELECT timestamp
+        FROM processes
+        WHERE parent ISNULL
+        ORDER BY id;
+        ''')
     run_timestamps = [r_timestamp for r_timestamp, in executions][1:]
     proc_cursor.close()
 
@@ -99,68 +125,64 @@ def get_files(conn):
                 for filename in find_all_links(linker, True):
                     if filename not in files:
                         f = TracedFile(filename)
-                        f.read()
+                        f.read(None)
                         files[f.path] = f
 
-    # Adds executed files
-    exec_cursor = conn.cursor()
-    executed_files = exec_cursor.execute(
-            '''
-            SELECT name, timestamp
-            FROM executed_files
-            ORDER BY timestamp;
-            ''')
+    # Loops on executed files, and opened files, at the same time
+    cur = conn.cursor()
+    rows = cur.execute(
+        '''
+        SELECT 'exec' AS event_type, name, NULL AS mode, timestamp
+        FROM executed_files
+        UNION ALL
+        SELECT 'open' AS event_type, name, mode, timestamp
+        FROM opened_files
+        ORDER BY timestamp;
+        ''')
     executed = set()
-    # ... and opened files
-    open_cursor = conn.cursor()
-    opened_files = open_cursor.execute(
-            '''
-            SELECT name, mode, timestamp
-            FROM opened_files
-            ORDER BY timestamp;
-            ''')
-    # Loop on both lists at once
-    rows = heapq.merge(((r[1], 'exec', r) for r in executed_files),
-                       ((r[2], 'open', r) for r in opened_files))
-    for ts, event_type, data in rows:
+    run = 0
+    for event_type, r_name, r_mode, r_timestamp in rows:
         if event_type == 'exec':
-            r_name, r_timestamp = data
             r_mode = FILE_READ
-        else:  # event_type == 'open'
-            r_name, r_mode, r_timestamp = data
-        r_name = Path(r_name)
-
-        if event_type == 'exec':
-            executed.add(r_name)
+        r_name = Path(normalize_path(r_name))
 
         # Stays on the current run
         while run_timestamps and r_timestamp > run_timestamps[0]:
             del run_timestamps[0]
             access_files.append(set())
+            run += 1
 
         # Adds symbolic links as read files
-        for filename in find_all_links(r_name, False):
+        for filename in find_all_links(r_name.parent if r_mode & FILE_LINK
+                                       else r_name, False):
             if filename not in files:
                 f = TracedFile(filename)
-                f.read()
+                f.read(run)
                 files[f.path] = f
-        # Adds final target
-        r_name = r_name.resolve()
+        # Go to final target
+        if not r_mode & FILE_LINK:
+            r_name = r_name.resolve()
+        if event_type == 'exec':
+            executed.add(r_name)
         if r_name not in files:
             f = TracedFile(r_name)
             files[f.path] = f
         else:
             f = files[r_name]
         if r_mode & FILE_WRITE:
-            f.write()
+            f.write(run)
+            # Mark the parent directory as read
+            if r_name.parent not in files:
+                fp = TracedFile(r_name.parent)
+                fp.read(run)
+                files[fp.path] = fp
         elif r_mode & FILE_READ:
-            f.read()
+            f.read(run)
 
         # Identifies input files
         if r_name.is_file() and r_name not in executed:
             access_files[-1].add(f)
-    exec_cursor.close()
-    open_cursor.close()
+    cur.close()
 
     # Further filters input files
     inputs = [[fi.path
@@ -168,14 +190,15 @@ def get_files(conn):
                # Input files are regular files,
                if fi.path.is_file() and
                # ONLY_READ,
-               fi.what == TracedFile.ONLY_READ and
+               fi.runs[r] == TracedFile.ONLY_READ and
                # not executable,
-               # FIXME : currently disabled. Maybe only remove executed files?
+               # FIXME : currently disabled; only remove executed files
                # not fi.path.stat().st_mode & 0b111 and
+               fi.path not in executed and
                # not in a system directory
                not any(fi.path.lies_under(m)
                        for m in magic_dirs + system_dirs)]
-              for lst in access_files]
+              for r, lst in enumerate(access_files)]
 
     # Identify output files
     outputs = [[fi.path
@@ -183,79 +206,87 @@ def get_files(conn):
                 # Output files are regular files,
                 if fi.path.is_file() and
                 # WRITTEN
-                fi.what == TracedFile.WRITTEN and
+                fi.runs[r] == TracedFile.WRITTEN and
                 # not in a system directory
                 not any(fi.path.lies_under(m)
                         for m in magic_dirs + system_dirs)]
-               for lst in access_files]
+               for r, lst in enumerate(access_files)]
+
+    # Run the list of files through the filter plugins
+    run_filter_plugins(files, inputs)
+
+    # Files removed from plugins should be removed from inputs as well
+    inputs = [[path for path in lst if path in files]
+              for lst in inputs]
 
     # Displays a warning for READ_THEN_WRITTEN files
     read_then_written_files = [
-            fi
-            for fi in itervalues(files)
-            if fi.what == TracedFile.READ_THEN_WRITTEN and
-            not any(fi.path.lies_under(m) for m in magic_dirs)]
+        fi
+        for fi in itervalues(files)
+        if fi.what == TracedFile.READ_THEN_WRITTEN and
+        not any(fi.path.lies_under(m) for m in magic_dirs)]
     if read_then_written_files:
         logging.warning(
-                "Some files were read and then written. We will only pack the "
-                "final version of the file; reproducible experiments "
-                "shouldn't change their input files:\n%s",
-                ", ".join(unicode_(fi.path) for fi in read_then_written_files))
+            "Some files were read and then written. We will only pack the "
+            "final version of the file; reproducible experiments shouldn't "
+            "change their input files")
+        logging.info("Paths:\n%s",
+                     ", ".join(unicode_(fi.path)
+                               for fi in read_then_written_files))
 
     files = set(
-            fi
-            for fi in itervalues(files)
-            if fi.what != TracedFile.WRITTEN and not any(fi.path.lies_under(m)
-                                                         for m in magic_dirs))
+        fi
+        for fi in itervalues(files)
+        if fi.what != TracedFile.WRITTEN and not any(fi.path.lies_under(m)
+                                                     for m in magic_dirs))
     return files, inputs, outputs
 
 
-def list_directories(conn):
-    """Gets additional needed directories from the trace database.
+def tty_prompt(prompt, chars):
+    """Get input from the terminal.
 
-    Returns the directories which are used as a process's working directory or
-    in which files are created.
+    On Linux, this will find the controlling terminal and ask there.
+
+    :param prompt: String to be displayed on the terminal before reading the
+        input.
+    :param chars: Accepted character responses.
     """
-    cur = conn.cursor()
-    executed_files = cur.execute(
-            '''
-            SELECT name, mode
-            FROM opened_files
-            WHERE mode = ? OR mode = ?
-            ''',
-            (FILE_WDIR, FILE_WRITE))
-    executed_files = ((Path(n), m) for n, m in executed_files)
-    # If WDIR, the name is a folder that was used as working directory
-    # If WRITE, the name is a file that was written to; its directory must
-    # exist
-    result = set(TracedFile(n if m == FILE_WDIR else n.parent)
-                 for n, m in executed_files)
-    cur.close()
-    return result
+    try:
+        import termios
 
+        fd = os.open('/dev/tty', os.O_RDWR | os.O_NOCTTY)
+        stream = os.fdopen(fd, 'w+', 1)
+        old = termios.tcgetattr(fd)
+    except (ImportError, AttributeError, IOError, OSError):
+        ostream = sys.stdout
+        istream = sys.stdin
+        if not os.isatty(sys.stdin.fileno()):
+            return None
 
-def merge_files(newfiles, newpackages, oldfiles, oldpackages):
-    """Merges two sets of packages and files.
-    """
-    files = set(oldfiles)
-    files.update(newfiles)
-
-    packages = dict((pkg.name, pkg) for pkg in newpackages)
-    for oldpkg in oldpackages:
-        if oldpkg.name in packages:
-            pkg = packages[oldpkg.name]
-            # Here we build TracedFiles from the Files so that the comment
-            # (size, etc) gets set
-            s = OrderedSet(TracedFile(fi.path) for fi in oldpkg.files)
-            s.update(pkg.files)
-            oldpkg.files = list(s)
-            packages[oldpkg.name] = oldpkg
-        else:
-            oldpkg.files = [TracedFile(fi.path) for fi in oldpkg.files]
-            packages[oldpkg.name] = oldpkg
-    packages = listvalues(packages)
-
-    return files, packages
+        while True:
+            ostream.write(prompt)
+            ostream.flush()
+            line = istream.readline()
+            if not line:
+                return None
+            elif line[0] in chars:
+                return line[0]
+    else:
+        new = old[:]
+        new[3] &= ~termios.ICANON  # 3 == 'lflags'
+        tcsetattr_flags = termios.TCSAFLUSH | getattr(termios, 'TCSASOFT', 0)
+        try:
+            termios.tcsetattr(fd, tcsetattr_flags, new)
+            stream.write(prompt)
+            stream.flush()
+            while True:
+                char = stream.read(1)
+                if char in chars:
+                    stream.write("\n")
+                    return char
+        finally:
+            termios.tcsetattr(fd, tcsetattr_flags, old)
+            stream.flush()
 
 
 def trace(binary, argv, directory, append, verbosity=1):
@@ -265,21 +296,40 @@ def trace(binary, argv, directory, append, verbosity=1):
     if (any(cwd.lies_under(c) for c in magic_dirs + system_dirs) and
             not cwd.lies_under('/usr/local')):
         logging.warning(
-                "You are running this experiment from a system directory! "
-                "Autodetection of non-system files will probably not work as "
-                "intended")
+            "You are running this experiment from a system directory! "
+            "Autodetection of non-system files will probably not work as "
+            "intended")
 
     # Trace directory
-    if not append:
-        if directory.exists():
-            logging.info("Removing existing directory %s", directory)
+    if directory.exists():
+        if append is None:
+            r = tty_prompt(
+                "Trace directory %s exists\n"
+                "(a)ppend run to the trace, (d)elete it or (s)top? [a/d/s] " %
+                directory,
+                'aAdDsS')
+            if r is None:
+                logging.critical(
+                    "Trace directory %s exists\n"
+                    "Please use either --continue or --overwrite\n",
+                    directory)
+                sys.exit(1)
+            elif r in 'sS':
+                sys.exit(1)
+            elif r in 'dD':
+                directory.rmtree()
+                directory.mkdir()
+            logging.warning(
+                "You can use --overwrite to replace the existing trace "
+                "(or --continue to append\nwithout prompt)")
+        elif append is False:
+            logging.info("Removing existing trace directory %s", directory)
             directory.rmtree()
-        directory.mkdir(parents=True)
-    else:
-        if not directory.exists():
-            logging.warning("--continue was specified but %s does not exist "
-                            "-- creating", directory)
             directory.mkdir(parents=True)
+    else:
+        if append is True:
+            logging.warning("--continue was set but trace doesn't exist yet")
+        directory.mkdir()
 
     # Runs the trace
     database = directory / 'trace.sqlite3'
@@ -295,7 +345,8 @@ def trace(binary, argv, directory, append, verbosity=1):
     logging.info("Program completed")
 
 
-def write_configuration(directory, sort_packages, overwrite=False):
+def write_configuration(directory, sort_packages, find_inputs_outputs,
+                        overwrite=False):
     """Writes the canonical YAML configuration file.
     """
     database = directory / 'trace.sqlite3'
@@ -316,49 +367,52 @@ def write_configuration(directory, sort_packages, overwrite=False):
     else:
         packages = []
 
-    # Makes sure all the directories used as working directories are packed
-    # (they already do if files from them are used, but empty directories do
-    # not get packed inside a tar archive)
-    files.update(d for d in list_directories(conn) if d.path.is_dir())
-
     # Writes configuration file
     config = directory / 'config.yml'
     distribution = platform.linux_distribution()[0:2]
-    oldconfig = not overwrite and config.exists()
     cur = conn.cursor()
-    if oldconfig:
-        # Loads in previous config
-        runs, oldpkgs, oldfiles, patterns = load_config(config,
-                                                        canonical=False,
-                                                        File=TracedFile)
-        # Here, additional patterns are discarded
-
-        executions = cur.execute(
-                '''
-                SELECT e.name, e.argv, e.envp, e.workingdir, p.exitcode
-                FROM executed_files e
-                INNER JOIN processes p on p.id=e.id
-                WHERE p.parent ISNULL
-                ORDER BY p.id DESC
-                LIMIT 1;
-                ''')
-        inputs = inputs[-1:]
-
-        files, packages = merge_files(files, packages,
-                                      oldfiles,
-                                      oldpkgs)
-    else:
+    if overwrite or not config.exists():
         runs = []
+        # This gets all the top-level processes (p.parent ISNULL) and the first
+        # executed file for that process (sorting by ids, which are
+        # chronological)
         executions = cur.execute(
-                '''
-                SELECT e.name, e.argv, e.envp, e.workingdir, p.exitcode
-                FROM executed_files e
-                INNER JOIN processes p on p.id=e.id
-                WHERE p.parent ISNULL
-                ORDER BY p.id;
-                ''')
-    for ((r_name, r_argv, r_envp, r_workingdir, r_exitcode),
-            input_files, output_files) in izip(executions, inputs, outputs):
+            '''
+            SELECT e.name, e.argv, e.envp, e.workingdir,
+                   p.timestamp, p.exit_timestamp, p.exitcode
+            FROM processes p
+            JOIN executed_files e ON e.id=(
+                SELECT id FROM executed_files e2
+                WHERE e2.process=p.id
+                ORDER BY e2.id
+                LIMIT 1
+            )
+            WHERE p.parent ISNULL;
+            ''')
+    else:
+        # Loads in previous config
+        runs, oldpkgs, oldfiles = load_config(config,
+                                              canonical=False,
+                                              File=TracedFile)
+
+        # Same query as previous block but only gets last process
+        executions = cur.execute(
+            '''
+            SELECT e.name, e.argv, e.envp, e.workingdir,
+                   p.timestamp, p.exit_timestamp, p.exitcode
+            FROM processes p
+            JOIN executed_files e ON e.id=(
+                SELECT id FROM executed_files e2
+                WHERE e2.process=p.id
+                ORDER BY e2.id
+                LIMIT 1
+            )
+            WHERE p.parent ISNULL
+            ORDER BY p.id DESC
+            LIMIT 1;
+            ''')
+    for (r_name, r_argv, r_envp, r_workingdir,
+         r_start, r_end, r_exitcode) in executions:
         # Decodes command-line
         argv = r_argv.split('\0')
         if not argv[-1]:
@@ -370,82 +424,100 @@ def write_configuration(directory, sort_packages, overwrite=False):
             envp = envp[:-1]
         environ = dict(v.split('=', 1) for v in envp)
 
-        # Gets files from command-line
-        command_line_files = {}
-        for i, arg in enumerate(argv):
-            p = Path(r_workingdir, arg).resolve()
-            if p.is_file():
-                command_line_files[p] = i
-        input_files_on_cmdline = sum(1
-                                     for in_file in input_files
-                                     if in_file in command_line_files)
-        output_files_on_cmdline = sum(1
-                                      for out_file in input_files
-                                      if out_file in command_line_files)
-
-        # Labels input files
-        input_files_dict = {}
-        for in_file in input_files:
-            # If file is on the command-line
-            if in_file in command_line_files:
-                if input_files_on_cmdline > 1:
-                    label = "arg_%d" % command_line_files[in_file]
-                else:
-                    label = "arg"
-            # Else, use file's name
-            else:
-                label = in_file.unicodename
-            # Make labels unique
-            uniquelabel = label
-            i = 1
-            while uniquelabel in input_files_dict:
-                i += 1
-                uniquelabel = '%s_%d' % (label, i)
-            input_files_dict[uniquelabel] = str(in_file)
-        # TODO : Note that right now, we keep as input files the ones that
-        # don't appear on the command-line
-
-        # Labels output files
-        output_files_dict = {}
-        for out_file in output_files:
-            # If file is on the command-line
-            if out_file in command_line_files:
-                if output_files_on_cmdline > 1:
-                    label = "arg_%d" % command_line_files[out_file]
-                else:
-                    label = "arg"
-            # Else, use file's name
-            else:
-                label = out_file.unicodename
-            # Make labels unique
-            uniquelabel = label
-            i = 1
-            while uniquelabel in output_files_dict:
-                i += 1
-                uniquelabel = '%s_%d' % (label, i)
-            output_files_dict[uniquelabel] = str(out_file)
-        # TODO : Note that right now, we keep as output files the ones that
-        # don't appear on the command-line
-
-        runs.append({'binary': r_name, 'argv': argv,
-                     'workingdir': Path(r_workingdir).path,
+        run = {'id': "run%d" % len(runs),
+                     'binary': r_name, 'argv': argv,
+                     'workingdir': unicode_(Path(r_workingdir)),
                      'architecture': platform.machine().lower(),
                      'distribution': distribution,
                      'hostname': platform.node(),
                      'system': [platform.system(), platform.release()],
                      'environ': environ,
                      'uid': os.getuid(),
-                     'gid': os.getgid(),
-                     'signal' if r_exitcode & 0x0100 else 'exitcode':
-                         r_exitcode & 0xFF,
-                     'input_files': input_files_dict,
-                     'output_files': output_files_dict})
-    cur.close()
+                     'gid': os.getgid()}
 
+        if r_exitcode & 0x0100:
+            run['signal'] = r_exitcode & 0xFF
+        else:
+            run['exitcode'] = r_exitcode & 0xFF
+
+        if r_end is not None:
+            run['walltime'] = (r_end - r_start) / 1.0E9  # ns to s
+
+        runs.append(run)
+
+    cur.close()
     conn.close()
 
-    save_config(config, runs, packages, files, reprozip_version)
+    if find_inputs_outputs:
+        inputs_outputs = compile_inputs_outputs(runs, inputs, outputs)
+    else:
+        inputs_outputs = {}
+
+    save_config(config, runs, packages, files, reprozip_version,
+                inputs_outputs)
 
     print("Configuration file written in {0!s}".format(config))
     print("Edit that file then run the packer -- "
           "use 'reprozip pack -h' for help")
+
+
+def compile_inputs_outputs(runs, inputs, outputs):
+    """Gives names to input/output files and creates InputOutputFile objects.
+    """
+    # {path: (run_nb, arg_nb) or None}
+    runs_with_file = {}
+    # run_nb: number_of_file_arguments
+    nb_file_args = []
+    # {path: [runs]}
+    readers = {}
+    writers = {}
+
+    for run_nb, run, in_files, out_files in izip(count(), runs,
+                                                 inputs, outputs):
+        # List which runs read or write each file
+        for p in in_files:
+            readers.setdefault(p, []).append(run_nb)
+        for p in out_files:
+            writers.setdefault(p, []).append(run_nb)
+
+        # Locate files that appear on a run's command line
+        files_set = set(in_files) | set(out_files)
+        nb_files = 0
+        for arg_nb, arg in enumerate(run['argv']):
+            p = Path(run['workingdir'], arg).resolve()
+            if p in files_set:
+                nb_files += 1
+                if p not in runs_with_file:
+                    runs_with_file[p] = run_nb, arg_nb
+                elif runs_with_file[p] is not None:
+                    runs_with_file[p] = None
+        nb_file_args.append(nb_files)
+
+    file_names = {}
+    make_unique = UniqueNames()
+
+    for fi in flatten(2, (inputs, outputs)):
+        if fi in file_names:
+            continue
+
+        # If it appears in at least one of the command-lines
+        if fi in runs_with_file:
+            # If it only appears once in the command-lines
+            if runs_with_file[fi] is not None:
+                run_nb, arg_nb = runs_with_file[fi]
+                parts = []
+                # Run number, if there are more than one runs
+                if len(runs) > 1:
+                    parts.append(run_nb)
+                # Argument number, if there are more than one file arguments
+                if nb_file_args[run_nb] > 1:
+                    parts.append(arg_nb)
+                file_names[fi] = make_unique(
+                    'arg%s' % '_'.join('%s' % s for s in parts))
+            else:
+                file_names[fi] = make_unique('arg_%s' % fi.unicodename)
+        else:
+            file_names[fi] = make_unique(fi.unicodename)
+
+    return dict((n, InputOutputFile(p, readers.get(p, []), writers.get(p, [])))
+                for p, n in iteritems(file_names))

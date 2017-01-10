@@ -1,23 +1,24 @@
+import io
 import os
 from setuptools import setup
-import sys
 
 
 # pip workaround
 os.chdir(os.path.abspath(os.path.dirname(__file__)))
 
 
-with open('README.rst') as fp:
+# Need to specify encoding for PY3, which has the worst unicode handling ever
+with io.open('README.rst', encoding='utf-8') as fp:
     description = fp.read()
 req = [
     'PyYAML',
     'rpaths>=0.8',
-    'usagestats>=0.3']
-if sys.version_info < (2, 7):
-    req.append('argparse')
+    'usagestats>=0.3',
+    'requests']
 setup(name='reprounzip',
-      version='0.5.1',
-      packages=['reprounzip', 'reprounzip.unpackers', 'reprounzip.plugins'],
+      version='1.1.0',
+      packages=['reprounzip', 'reprounzip.unpackers',
+                'reprounzip.unpackers.common', 'reprounzip.plugins'],
       entry_points={
           'console_scripts': [
               'reprounzip = reprounzip.main:main'],
@@ -31,7 +32,8 @@ setup(name='reprounzip',
       namespace_packages=['reprounzip', 'reprounzip.unpackers'],
       install_requires=req,
       extras_require={
-          'all': ['reprounzip-vagrant>=0.5', 'reprounzip-docker>=0.5']},
+          'all': ['reprounzip-vagrant>=1.0', 'reprounzip-docker>=1.0',
+                  'reprounzip-vistrails>=1.0']},
       description="Linux tool enabling reproducible experiments (unpacker)",
       author="Remi Rampin, Fernando Chirigati, Dennis Shasha, Juliana Freire",
       author_email='reprozip-users@vgc.poly.edu',
@@ -43,8 +45,13 @@ setup(name='reprounzip',
       keywords=['reprozip', 'reprounzip', 'reproducibility', 'provenance',
                 'vida', 'nyu'],
       classifiers=[
-          'Development Status :: 3 - Alpha',
+          'Development Status :: 5 - Production/Stable',
           'Intended Audience :: Science/Research',
           'License :: OSI Approved :: BSD License',
+          'Programming Language :: Python :: 2.7',
+          'Programming Language :: Python :: 3',
+          'Programming Language :: Python :: 3.3',
+          'Programming Language :: Python :: 3.4',
+          'Programming Language :: Python :: 3.5',
           'Topic :: Scientific/Engineering',
           'Topic :: System :: Archiving'])

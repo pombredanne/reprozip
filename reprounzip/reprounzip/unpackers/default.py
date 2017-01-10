@@ -1,4 +1,4 @@
-# Copyright (C) 2014 New York University
+# Copyright (C) 2014-2016 New York University
 # This file is part of ReproZip which is released under the Revised BSD License
 # See file LICENSE for full license details.
 
@@ -14,26 +14,32 @@ This file contains the default plugins that come with reprounzip:
   not packed and you do not have them installed.
 """
 
-from __future__ import unicode_literals
+from __future__ import division, print_function, unicode_literals
 
 import argparse
+import copy
 import logging
 import os
-import pickle
 import platform
 from rpaths import PosixPath, DefaultAbstractPath, Path
+import socket
 import subprocess
 import sys
 import tarfile
 
-from reprounzip.common import load_config as load_config_file, record_usage
+from reprounzip.common import RPZPack, load_config as load_config_file, \
+    record_usage
 from reprounzip import signals
 from reprounzip.unpackers.common import THIS_DISTRIBUTION, PKG_NOT_INSTALLED, \
-    COMPAT_OK, COMPAT_NO, target_must_exist, shell_escape, load_config, \
-    select_installer, busybox_url, join_root, FileUploader, FileDownloader, \
-    get_runs
+    COMPAT_OK, COMPAT_NO, CantFindInstaller, target_must_exist, shell_escape, \
+    load_config, select_installer, busybox_url, join_root, FileUploader, \
+    FileDownloader, get_runs, add_environment_options, fixup_environment, \
+    interruptible_call, metadata_read, metadata_write, \
+    metadata_initial_iofiles, metadata_update_run
+from reprounzip.unpackers.common.x11 import X11Handler, LocalForwarder
 from reprounzip.utils import unicode_, irange, iteritems, itervalues, \
-    make_dir_writable, rmtree_fixed, download_file
+    stdout_bytes, stderr, make_dir_writable, rmtree_fixed, copyfile, \
+    download_file
 
 
 def installpkgs(args):
@@ -49,7 +55,10 @@ def installpkgs(args):
     # Loads config
     runs, packages, other_files = load_config(pack)
 
-    installer = select_installer(pack, runs)
+    try:
+        installer = select_installer(pack, runs)
+    except CantFindInstaller as e:
+        logging.error("Couldn't select a package installer: %s", e)
 
     if args.summary:
         # Print out a list of packages with their status
@@ -79,23 +88,8 @@ def installpkgs(args):
                 logging.warning("version %s of %s was installed, instead of "
                                 "%s", real, pkg.name, req)
         if r != 0:
+            logging.critical("Installer exited with %d", r)
             sys.exit(r)
-
-
-def write_dict(filename, dct, type_):
-    to_write = {'unpacker': type_}
-    to_write.update(dct)
-    with filename.open('wb') as fp:
-        pickle.dump(to_write, fp, 2)
-
-
-def read_dict(filename, type_):
-    with filename.open('rb') as fp:
-        dct = pickle.load(fp)
-    if type_ is not None and dct['unpacker'] != type_:
-        raise ValueError("Wrong unpacker used: %s != %s" % (dct['unpacker'],
-                                                            type_))
-    return dct
 
 
 def directory_create(args):
@@ -124,17 +118,15 @@ def directory_create(args):
     signals.pre_setup(target=target, pack=pack)
 
     # Unpacks configuration file
-    tar = tarfile.open(str(pack), 'r:*')
-    member = tar.getmember('METADATA/config.yml')
-    member.name = 'config.yml'
-    tar.extract(member, str(target))
+    rpz_pack = RPZPack(pack)
+    rpz_pack.extract_config(target / 'config.yml')
 
     # Loads config
-    runs, packages, other_files = load_config_file(target / 'config.yml', True)
+    config = load_config_file(target / 'config.yml', True)
+    packages = config.packages
 
     target.mkdir()
     root = (target / 'root').absolute()
-    root.mkdir()
 
     # Checks packages
     missing_files = False
@@ -142,64 +134,52 @@ def directory_create(args):
         if pkg.packfiles:
             continue
         for f in pkg.files:
-            f = Path(f.path)
-            if not f.exists():
+            if not Path(f.path).exists():
                 logging.error(
-                        "Missing file %s (from package %s that wasn't packed) "
-                        "on host, experiment will probably miss it.",
-                        f, pkg.name)
+                    "Missing file %s (from package %s that wasn't packed) "
+                    "on host, experiment will probably miss it.",
+                    f, pkg.name)
                 missing_files = True
     if missing_files:
         record_usage(directory_missing_pkgs=True)
-        logging.error(
-                "Some packages are missing, you should probably install "
-                "them.\nUse 'reprounzip installpkgs -h' for help")
+        logging.error("Some packages are missing, you should probably install "
+                      "them.\nUse 'reprounzip installpkgs -h' for help")
 
-    # Unpacks files
-    if any('..' in m.name or m.name.startswith('/') for m in tar.getmembers()):
-        logging.critical("Tar archive contains invalid pathnames")
-        sys.exit(1)
-    members = [m for m in tar.getmembers() if m.name.startswith('DATA/')]
-    for m in members:
-        m.name = m.name[5:]
-    # Makes symlink targets relative
-    for m in members:
-        if not m.issym():
-            continue
-        linkname = PosixPath(m.linkname)
-        if linkname.is_absolute:
-            m.linkname = join_root(root, PosixPath(m.linkname)).path
-    logging.info("Extracting files...")
-    tar.extractall(str(root), members)
-    tar.close()
-
-    # Gets library paths
-    lib_dirs = []
-    p = subprocess.Popen(['/sbin/ldconfig', '-v', '-N'],
-                         stdout=subprocess.PIPE)
+    root.mkdir()
     try:
-        for l in p.stdout:
-            if len(l) < 3 or l[0] in (b' ', b'\t'):
-                continue
-            if l.endswith(b':\n'):
-                lib_dirs.append(Path(l[:-2]))
-    finally:
-        p.wait()
+        # Unpacks files
+        members = rpz_pack.list_data()
+        for m in members:
+            # Remove 'DATA/' prefix
+            m.name = str(rpz_pack.remove_data_prefix(m.name))
+            # Makes symlink targets relative
+            if m.issym():
+                linkname = PosixPath(m.linkname)
+                if linkname.is_absolute:
+                    m.linkname = join_root(root, PosixPath(m.linkname)).path
+        logging.info("Extracting files...")
+        rpz_pack.extract_data(root, members)
+        rpz_pack.close()
 
-    # Original input files, so upload can restore them
-    if any(run['input_files'] for run in runs):
-        logging.info("Packing up original input files...")
-        inputtar = tarfile.open(str(target / 'inputs.tar.gz'), 'w:gz')
-        for run in runs:
-            for ifile in itervalues(run['input_files']):
-                inputtar.add(str(join_root(root, PosixPath(ifile))),
-                             str(PosixPath(ifile)))
-        inputtar.close()
+        # Original input files, so upload can restore them
+        input_files = [f.path for f in itervalues(config.inputs_outputs)
+                       if f.read_runs]
+        if input_files:
+            logging.info("Packing up original input files...")
+            inputtar = tarfile.open(str(target / 'inputs.tar.gz'), 'w:gz')
+            for ifile in input_files:
+                filename = join_root(root, ifile)
+                if filename.exists():
+                    inputtar.add(str(filename), str(ifile))
+            inputtar.close()
 
-    # Meta-data for reprounzip
-    write_dict(target / '.reprounzip', {}, 'directory')
+        # Meta-data for reprounzip
+        metadata_write(target, metadata_initial_iofiles(config), 'directory')
 
-    signals.post_setup(target=target)
+        signals.post_setup(target=target, pack=pack)
+    except Exception:
+        rmtree_fixed(root)
+        raise
 
 
 @target_must_exist
@@ -207,11 +187,12 @@ def directory_run(args):
     """Runs the command in the directory.
     """
     target = Path(args.target[0])
-    read_dict(target / '.reprounzip', 'directory')
+    unpacked_info = metadata_read(target, 'directory')
     cmdline = args.cmdline
 
     # Loads config
-    runs, packages, other_files = load_config_file(target / 'config.yml', True)
+    config = load_config_file(target / 'config.yml', True)
+    runs = config.runs
 
     selected_runs = get_runs(runs, args.run, cmdline)
 
@@ -237,11 +218,18 @@ def directory_run(args):
     for run_number in selected_runs:
         run = runs[run_number]
         cmd = 'cd %s && ' % shell_escape(
-                unicode_(join_root(root,
-                                   Path(run['workingdir']))))
+            unicode_(join_root(root,
+                               Path(run['workingdir']))))
         cmd += '/usr/bin/env -i '
-        cmd += ' '.join('%s=%s' % (k, shell_escape(v))
-                        for k, v in iteritems(run['environ'])
+        environ = run['environ']
+        environ = fixup_environment(environ, args)
+        if args.x11:
+            if 'DISPLAY' in os.environ:
+                environ['DISPLAY'] = os.environ['DISPLAY']
+            if 'XAUTHORITY' in os.environ:
+                environ['XAUTHORITY'] = os.environ['XAUTHORITY']
+        cmd += ' '.join('%s=%s' % (shell_escape(k), shell_escape(v))
+                        for k, v in iteritems(environ)
                         if k != 'PATH')
         cmd += ' '
 
@@ -284,9 +272,13 @@ def directory_run(args):
     cmds = ' && '.join(cmds)
 
     signals.pre_run(target=target)
-    retcode = subprocess.call(cmds, shell=True)
-    sys.stderr.write("\n*** Command finished, status: %d\n" % retcode)
+    retcode = interruptible_call(cmds, shell=True)
+    stderr.write("\n*** Command finished, status: %d\n" % retcode)
     signals.post_run(target=target, retcode=retcode)
+
+    # Update input file status
+    metadata_update_run(config, unpacked_info, selected_runs)
+    metadata_write(target, unpacked_info, 'directory')
 
 
 @target_must_exist
@@ -294,7 +286,7 @@ def directory_destroy(args):
     """Destroys the directory.
     """
     target = Path(args.target[0])
-    read_dict(target / '.reprounzip', 'directory')
+    metadata_read(target, 'directory')
 
     logging.info("Removing directory %s...", target)
     signals.pre_destroy(target=target)
@@ -383,7 +375,7 @@ def chroot_create(args):
         logging.critical("Target directory exists")
         sys.exit(1)
 
-    if DefaultAbstractPath is not PosixPath:
+    if not issubclass(DefaultAbstractPath, PosixPath):
         logging.critical("Not unpacking on POSIX system")
         sys.exit(1)
 
@@ -393,94 +385,103 @@ def chroot_create(args):
     restore_owner = should_restore_owner(args.restore_owner)
 
     # Unpacks configuration file
-    tar = tarfile.open(str(pack), 'r:*')
-    member = tar.getmember('METADATA/config.yml')
-    member.name = 'config.yml'
-    tar.extract(member, str(target))
+    rpz_pack = RPZPack(pack)
+    rpz_pack.extract_config(target / 'config.yml')
 
     # Loads config
-    runs, packages, other_files = load_config_file(target / 'config.yml', True)
+    config = load_config_file(target / 'config.yml', True)
+    packages = config.packages
 
     target.mkdir()
     root = (target / 'root').absolute()
-    root.mkdir()
 
-    # Checks that everything was packed
-    packages_not_packed = [pkg for pkg in packages if not pkg.packfiles]
-    if packages_not_packed:
-        record_usage(chroot_missing_pkgs=True)
-        logging.warning("According to configuration, some files were left out "
-                        "because they belong to the following packages:%s"
-                        "\nWill copy files from HOST SYSTEM",
-                        ''.join('\n    %s' % pkg
-                                for pkg in packages_not_packed))
-        for pkg in packages_not_packed:
-            for f in pkg.files:
-                f = Path(f.path)
-                if not f.exists():
-                    logging.error(
+    root.mkdir()
+    try:
+        # Checks that everything was packed
+        packages_not_packed = [pkg for pkg in packages if not pkg.packfiles]
+        if packages_not_packed:
+            record_usage(chroot_missing_pkgs=True)
+            logging.warning("According to configuration, some files were left "
+                            "out because they belong to the following "
+                            "packages:%s\nWill copy files from HOST SYSTEM",
+                            ''.join('\n    %s' % pkg
+                                    for pkg in packages_not_packed))
+            missing_files = False
+            for pkg in packages_not_packed:
+                for f in pkg.files:
+                    path = Path(f.path)
+                    if not path.exists():
+                        logging.error(
                             "Missing file %s (from package %s) on host, "
                             "experiment will probably miss it",
-                            f, pkg.name)
-                dest = join_root(root, f)
-                dest.parent.mkdir(parents=True)
-                if f.is_link():
-                    dest.symlink(f.read_link())
-                else:
-                    f.copy(dest)
-                if restore_owner:
-                    stat = f.stat()
-                    dest.chown(stat.st_uid, stat.st_gid)
+                            path, pkg.name)
+                        missing_files = True
+                        continue
+                    dest = join_root(root, path)
+                    dest.parent.mkdir(parents=True)
+                    if path.is_link():
+                        dest.symlink(path.read_link())
+                    else:
+                        path.copy(dest)
+                    if restore_owner:
+                        stat = path.stat()
+                        dest.chown(stat.st_uid, stat.st_gid)
+            if missing_files:
+                record_usage(chroot_mising_files=True)
 
-    # Unpacks files
-    if any('..' in m.name or m.name.startswith('/') for m in tar.getmembers()):
-        logging.critical("Tar archive contains invalid pathnames")
-        sys.exit(1)
-    members = [m for m in tar.getmembers() if m.name.startswith('DATA/')]
-    for m in members:
-        m.name = m.name[5:]
-    if not restore_owner:
-        uid = os.getuid()
-        gid = os.getgid()
+        # Unpacks files
+        members = rpz_pack.list_data()
         for m in members:
-            m.uid = uid
-            m.gid = gid
-    logging.info("Extracting files...")
-    tar.extractall(str(root), members)
-    tar.close()
+            # Remove 'DATA/' prefix
+            m.name = str(rpz_pack.remove_data_prefix(m.name))
+        if not restore_owner:
+            uid = os.getuid()
+            gid = os.getgid()
+            for m in members:
+                m.uid = uid
+                m.gid = gid
+        logging.info("Extracting files...")
+        rpz_pack.extract_data(root, members)
+        rpz_pack.close()
 
-    # Sets up /bin/sh and /usr/bin/env, downloading busybox if necessary
-    sh_path = join_root(root, Path('/bin/sh'))
-    env_path = join_root(root, Path('/usr/bin/env'))
-    if not sh_path.lexists() or not env_path.lexists():
-        logging.info("Setting up busybox...")
-        busybox_path = join_root(root, Path('/bin/busybox'))
-        busybox_path.parent.mkdir(parents=True)
-        with make_dir_writable(join_root(root, Path('/bin'))):
-            download_file(busybox_url(runs[0]['architecture']),
-                          busybox_path)
-            busybox_path.chmod(0o755)
-            if not sh_path.lexists():
-                sh_path.parent.mkdir(parents=True)
-                sh_path.symlink('/bin/busybox')
-            if not env_path.lexists():
-                env_path.parent.mkdir(parents=True)
-                env_path.symlink('/bin/busybox')
+        # Sets up /bin/sh and /usr/bin/env, downloading busybox if necessary
+        sh_path = join_root(root, Path('/bin/sh'))
+        env_path = join_root(root, Path('/usr/bin/env'))
+        if not sh_path.lexists() or not env_path.lexists():
+            logging.info("Setting up busybox...")
+            busybox_path = join_root(root, Path('/bin/busybox'))
+            busybox_path.parent.mkdir(parents=True)
+            with make_dir_writable(join_root(root, Path('/bin'))):
+                download_file(busybox_url(config.runs[0]['architecture']),
+                              busybox_path,
+                              'busybox-%s' % config.runs[0]['architecture'])
+                busybox_path.chmod(0o755)
+                if not sh_path.lexists():
+                    sh_path.parent.mkdir(parents=True)
+                    sh_path.symlink('/bin/busybox')
+                if not env_path.lexists():
+                    env_path.parent.mkdir(parents=True)
+                    env_path.symlink('/bin/busybox')
 
-    # Original input files, so upload can restore them
-    if any(run['input_files'] for run in runs):
-        logging.info("Packing up original input files...")
-        inputtar = tarfile.open(str(target / 'inputs.tar.gz'), 'w:gz')
-        for run in runs:
-            for ifile in itervalues(run['input_files']):
-                inputtar.add(str(join_root(root, PosixPath(ifile))),
-                             str(PosixPath(ifile)))
-        inputtar.close()
+        # Original input files, so upload can restore them
+        input_files = [f.path for f in itervalues(config.inputs_outputs)
+                       if f.read_runs]
+        if input_files:
+            logging.info("Packing up original input files...")
+            inputtar = tarfile.open(str(target / 'inputs.tar.gz'), 'w:gz')
+            for ifile in input_files:
+                filename = join_root(root, ifile)
+                if filename.exists():
+                    inputtar.add(str(filename), str(ifile))
+            inputtar.close()
 
-    # Meta-data for reprounzip
-    write_dict(target / '.reprounzip', {}, 'chroot')
+        # Meta-data for reprounzip
+        metadata_write(target, metadata_initial_iofiles(config), 'chroot')
 
-    signals.post_setup(target=target)
+        signals.post_setup(target=target, pack=pack)
+    except Exception:
+        rmtree_fixed(root)
+        raise
 
 
 @target_must_exist
@@ -488,15 +489,16 @@ def chroot_mount(args):
     """Mounts /dev and /proc inside the chroot directory.
     """
     target = Path(args.target[0])
-    read_dict(target / '.reprounzip', 'chroot')
+    unpacked_info = metadata_read(target, 'chroot')
 
-    for m in ('/dev', '/proc'):
+    for m in ('/dev', '/dev/pts', '/proc'):
         d = join_root(target / 'root', Path(m))
         d.mkdir(parents=True)
         logging.info("Mounting %s on %s...", m, d)
-        subprocess.check_call(['mount', '-o', 'rbind', m, str(d)])
+        subprocess.check_call(['mount', '-o', 'bind', m, str(d)])
 
-    write_dict(target / '.reprounzip', {'mounted': True}, 'chroot')
+    unpacked_info['mounted'] = True
+    metadata_write(target, unpacked_info, 'chroot')
 
     logging.warning("The host's /dev and /proc have been mounted into the "
                     "chroot. Do NOT remove the unpacked directory with "
@@ -508,23 +510,30 @@ def chroot_run(args):
     """Runs the command in the chroot.
     """
     target = Path(args.target[0])
-    read_dict(target / '.reprounzip', 'chroot')
+    unpacked_info = metadata_read(target, 'chroot')
     cmdline = args.cmdline
 
     # Loads config
-    runs, packages, other_files = load_config_file(target / 'config.yml', True)
+    config = load_config_file(target / 'config.yml', True)
+    runs = config.runs
 
     selected_runs = get_runs(runs, args.run, cmdline)
 
     root = target / 'root'
+
+    # X11 handler
+    x11 = X11Handler(args.x11, ('local', socket.gethostname()),
+                     args.x11_display)
 
     cmds = []
     for run_number in selected_runs:
         run = runs[run_number]
         cmd = 'cd %s && ' % shell_escape(run['workingdir'])
         cmd += '/usr/bin/env -i '
-        cmd += ' '.join('%s=%s' % (k, shell_escape(v))
-                        for k, v in iteritems(run['environ']))
+        environ = x11.fix_env(run['environ'])
+        environ = fixup_environment(environ, args)
+        cmd += ' '.join('%s=%s' % (shell_escape(k), shell_escape(v))
+                        for k, v in iteritems(environ))
         cmd += ' '
         # FIXME : Use exec -a or something if binary != argv[0]
         if cmdline is None:
@@ -535,41 +544,56 @@ def chroot_run(args):
         userspec = '%s:%s' % (run.get('uid', 1000),
                               run.get('gid', 1000))
         cmd = 'chroot --userspec=%s %s /bin/sh -c %s' % (
-                userspec,
-                shell_escape(unicode_(root)),
-                shell_escape(cmd))
+            userspec,
+            shell_escape(unicode_(root)),
+            shell_escape(cmd))
         cmds.append(cmd)
+    cmds = ['chroot %s /bin/sh -c %s' % (shell_escape(unicode_(root)),
+                                         shell_escape(c))
+            for c in x11.init_cmds] + cmds
     cmds = ' && '.join(cmds)
 
+    # Starts forwarding
+    forwarders = []
+    for portnum, connector in x11.port_forward:
+        fwd = LocalForwarder(connector, portnum)
+        forwarders.append(fwd)
+
     signals.pre_run(target=target)
-    retcode = subprocess.call(cmds, shell=True)
-    sys.stderr.write("\n*** Command finished, status: %d\n" % retcode)
+    retcode = interruptible_call(cmds, shell=True)
+    stderr.write("\n*** Command finished, status: %d\n" % retcode)
     signals.post_run(target=target, retcode=retcode)
+
+    # Update input file status
+    metadata_update_run(config, unpacked_info, selected_runs)
+    metadata_write(target, unpacked_info, 'chroot')
 
 
 def chroot_unmount(target):
     """Unmount magic directories, if they are mounted.
     """
-    unpacked_info = read_dict(target / '.reprounzip', 'chroot')
+    unpacked_info = metadata_read(target, 'chroot')
     mounted = unpacked_info.get('mounted', False)
 
     if not mounted:
         return False
 
-    unpacked_info['mounted'] = False
-    write_dict(target / '.reprounzip', unpacked_info, 'chroot')
-
+    target = target.resolve()
     for m in ('/dev', '/proc'):
         d = join_root(target / 'root', Path(m))
         if d.exists():
             logging.info("Unmounting %s...", d)
             # Unmounts recursively
             subprocess.check_call(
-                    'grep %s /proc/mounts | '
-                    'cut -f2 -d" " | '
-                    'sort -r | '
-                    'xargs umount' % d,
-                    shell=True)
+                'grep %s /proc/mounts | '
+                'cut -f2 -d" " | '
+                'sort -r | '
+                'xargs umount' % d,
+                shell=True)
+
+    unpacked_info['mounted'] = False
+    metadata_write(target, unpacked_info, 'chroot')
+
     return True
 
 
@@ -589,7 +613,7 @@ def chroot_destroy_dir(args):
     """Destroys the directory.
     """
     target = Path(args.target[0])
-    mounted = read_dict(target / '.reprounzip', 'chroot').get('mounted', False)
+    mounted = metadata_read(target, 'chroot').get('mounted', False)
 
     if mounted:
         logging.critical("Magic directories might still be mounted")
@@ -628,8 +652,12 @@ class LocalUploader(FileUploader):
 
     def extract_original_input(self, input_name, input_path, temp):
         tar = tarfile.open(str(self.target / 'inputs.tar.gz'), 'r:*')
-        member = tar.getmember(str(join_root(PosixPath(''), input_path)))
-        member.name = str(temp.name)
+        try:
+            member = tar.getmember(str(join_root(PosixPath(''), input_path)))
+        except KeyError:
+            return None
+        member = copy.copy(member)
+        member.name = str(temp.components[-1])
         tar.extract(member, str(temp.parent))
         tar.close()
         return temp
@@ -652,20 +680,20 @@ def upload(args):
     """
     target = Path(args.target[0])
     files = args.file
-    unpacked_info = read_dict(target / '.reprounzip', args.type)
+    unpacked_info = metadata_read(target, args.type)
     input_files = unpacked_info.setdefault('input_files', {})
 
     try:
         LocalUploader(target, input_files, files,
                       args.type, args.type == 'chroot' and args.restore_owner)
     finally:
-        write_dict(target / '.reprounzip', unpacked_info, args.type)
+        metadata_write(target, unpacked_info, args.type)
 
 
 class LocalDownloader(FileDownloader):
-    def __init__(self, target, files, type_):
+    def __init__(self, target, files, type_, all_=False):
         self.type = type_
-        FileDownloader.__init__(self, target, files)
+        FileDownloader.__init__(self, target, files, all_=all_)
 
     def prepare_download(self, files):
         self.root = (self.target / 'root').absolute()
@@ -677,15 +705,10 @@ class LocalDownloader(FileDownloader):
         if not remote_path.exists():
             logging.critical("Can't get output file (doesn't exist): %s",
                              remote_path)
-            sys.exit(1)
+            return False
         with remote_path.open('rb') as fp:
-            chunk = fp.read(1024)
-            if chunk:
-                sys.stdout.buffer.write(chunk)
-            while len(chunk) == 1024:
-                chunk = fp.read(1024)
-                if chunk:
-                    sys.stdout.buffer.write(chunk)
+            copyfile(fp, stdout_bytes)
+        return True
 
     def download(self, remote_path, local_path):
         remote_path = join_root(self.root, remote_path)
@@ -694,9 +717,10 @@ class LocalDownloader(FileDownloader):
         if not remote_path.exists():
             logging.critical("Can't get output file (doesn't exist): %s",
                              remote_path)
-            sys.exit(1)
+            return False
         remote_path.copyfile(local_path)
         remote_path.copymode(local_path)
+        return True
 
 
 @target_must_exist
@@ -705,9 +729,9 @@ def download(args):
     """
     target = Path(args.target[0])
     files = args.file
-    read_dict(target / '.reprounzip', args.type)
+    metadata_read(target, args.type)
 
-    LocalDownloader(target, files, args.type)
+    LocalDownloader(target, files, args.type, all_=args.all)
 
 
 def test_same_pkgmngr(pack, config, **kwargs):
@@ -722,7 +746,7 @@ def test_same_pkgmngr(pack, config, **kwargs):
         return COMPAT_OK
     else:
         return COMPAT_NO, "Different distributions. Then: %s, now: %s" % (
-                orig_distribution, THIS_DISTRIBUTION)
+            orig_distribution, THIS_DISTRIBUTION)
 
 
 def test_linux_same_arch(pack, config, **kwargs):
@@ -739,7 +763,7 @@ def test_linux_same_arch(pack, config, **kwargs):
         return COMPAT_OK
     else:
         return COMPAT_NO, "Different architectures. Then: %s, now: %s" % (
-                orig_architecture, current_architecture)
+            orig_architecture, current_architecture)
 
 
 def setup_installpkgs(parser):
@@ -747,14 +771,14 @@ def setup_installpkgs(parser):
     """
     parser.add_argument('pack', nargs=1, help="Pack to process")
     parser.add_argument(
-            '-y', '--assume-yes', action='store_true', default=False,
-            help="Assumes yes for package manager's questions (if supported)")
+        '-y', '--assume-yes', action='store_true', default=False,
+        help="Assumes yes for package manager's questions (if supported)")
     parser.add_argument(
-            '--missing', action='store_true',
-            help="Only install packages that weren't packed")
+        '--missing', action='store_true',
+        help="Only install packages that weren't packed")
     parser.add_argument(
-            '--summary', action='store_true',
-            help="Don't install, print which packages are installed or not")
+        '--summary', action='store_true',
+        help="Don't install, print which packages are installed or not")
     parser.set_defaults(func=installpkgs)
 
     return {'test_compatibility': test_same_pkgmngr}
@@ -783,38 +807,49 @@ def setup_directory(parser, **kwargs):
     """
     subparsers = parser.add_subparsers(title="actions",
                                        metavar='', help=argparse.SUPPRESS)
-    options = argparse.ArgumentParser(add_help=False)
-    options.add_argument('target', nargs=1, help="Experiment directory")
+
+    def add_opt_general(opts):
+        opts.add_argument('target', nargs=1, help="Experiment directory")
 
     # setup
-    # Note: opt_setup is a separate parser so that 'pack' is before 'target'
-    opt_setup = argparse.ArgumentParser(add_help=False)
-    opt_setup.add_argument('pack', nargs=1, help="Pack to extract")
-    parser_setup = subparsers.add_parser('setup', parents=[opt_setup, options])
+    parser_setup = subparsers.add_parser('setup')
+    parser_setup.add_argument('pack', nargs=1, help="Pack to extract")
+    # Note: add_opt_general is called later so that 'pack' is before 'target'
+    add_opt_general(parser_setup)
     parser_setup.set_defaults(func=directory_create)
 
     # upload
-    parser_upload = subparsers.add_parser('upload', parents=[options])
+    parser_upload = subparsers.add_parser('upload')
+    add_opt_general(parser_upload)
     parser_upload.add_argument('file', nargs=argparse.ZERO_OR_MORE,
                                help="<path>:<input_file_name>")
     parser_upload.set_defaults(func=upload, type='directory')
 
     # run
-    parser_run = subparsers.add_parser('run', parents=[options])
-    parser_run.add_argument('run', default=None, nargs='?')
+    parser_run = subparsers.add_parser('run')
+    add_opt_general(parser_run)
+    parser_run.add_argument('run', default=None, nargs=argparse.OPTIONAL)
     parser_run.add_argument('--cmdline', nargs=argparse.REMAINDER,
                             help="Command line to run")
+    parser_run.add_argument('--enable-x11', action='store_true', default=False,
+                            dest='x11',
+                            help="Enable X11 support (needs an X server)")
+    add_environment_options(parser_run)
     parser_run.set_defaults(func=directory_run)
 
     # download
-    parser_download = subparsers.add_parser('download',
-                                            parents=[options])
+    parser_download = subparsers.add_parser('download')
+    add_opt_general(parser_download)
     parser_download.add_argument('file', nargs=argparse.ZERO_OR_MORE,
-                                 help="<output_file_name>:<path>")
+                                 help="<output_file_name>[:<path>]")
+    parser_download.add_argument('--all', action='store_true',
+                                 help="Download all output files to the "
+                                      "current directory")
     parser_download.set_defaults(func=download, type='directory')
 
     # destroy
-    parser_destroy = subparsers.add_parser('destroy', parents=[options])
+    parser_destroy = subparsers.add_parser('destroy')
+    add_opt_general(parser_destroy)
     parser_destroy.set_defaults(func=directory_destroy)
 
     return {'test_compatibility': test_linux_same_arch}
@@ -823,8 +858,9 @@ def setup_directory(parser, **kwargs):
 def chroot_setup(args):
     """Does both create and mount depending on --bind-magic-dirs.
     """
+    do_mount = should_mount_magic_dirs(args.bind_magic_dirs)
     chroot_create(args)
-    if should_mount_magic_dirs(args.bind_magic_dirs):
+    if do_mount:
         chroot_mount(args)
 
 
@@ -854,77 +890,97 @@ def setup_chroot(parser, **kwargs):
     """
     subparsers = parser.add_subparsers(title="actions",
                                        metavar='', help=argparse.SUPPRESS)
-    options = argparse.ArgumentParser(add_help=False)
-    options.add_argument('target', nargs=1, help="Experiment directory")
+
+    def add_opt_general(opts):
+        opts.add_argument('target', nargs=1, help="Experiment directory")
 
     # setup/create
-    opt_setup = argparse.ArgumentParser(add_help=False)
-    opt_setup.add_argument('pack', nargs=1, help="Pack to extract")
-    opt_owner = argparse.ArgumentParser(add_help=False)
-    opt_owner.add_argument('--preserve-owner', action='store_true',
-                           dest='restore_owner', default=None,
-                           help="Restore files' owner/group when extracting")
-    opt_owner.add_argument('--dont-preserve-owner', action='store_false',
-                           dest='restore_owner', default=None,
-                           help=("Don't restore files' owner/group when "
-                                 "extracting, use current users"))
-    parser_setup_create = subparsers.add_parser(
-            'setup/create',
-            parents=[opt_setup, options, opt_owner])
+    def add_opt_setup(opts):
+        opts.add_argument('pack', nargs=1, help="Pack to extract")
+
+    def add_opt_owner(opts):
+        opts.add_argument('--preserve-owner', action='store_true',
+                          dest='restore_owner', default=None,
+                          help="Restore files' owner/group when extracting")
+        opts.add_argument('--dont-preserve-owner', action='store_false',
+                          dest='restore_owner', default=None,
+                          help="Don't restore files' owner/group when "
+                               "extracting, use current users")
+
+    parser_setup_create = subparsers.add_parser('setup/create')
+    add_opt_setup(parser_setup_create)
+    add_opt_general(parser_setup_create)
+    add_opt_owner(parser_setup_create)
     parser_setup_create.set_defaults(func=chroot_create)
 
     # setup/mount
-    parser_setup_mount = subparsers.add_parser('setup/mount',
-                                               parents=[options])
+    parser_setup_mount = subparsers.add_parser('setup/mount')
+    add_opt_general(parser_setup_mount)
     parser_setup_mount.set_defaults(func=chroot_mount)
 
     # setup
-    parser_setup = subparsers.add_parser(
-            'setup',
-            parents=[opt_setup, options, opt_owner])
+    parser_setup = subparsers.add_parser('setup')
+    add_opt_setup(parser_setup)
+    add_opt_general(parser_setup)
+    add_opt_owner(parser_setup)
     parser_setup.add_argument(
-            '--bind-magic-dirs', action='store_true',
-            dest='bind_magic_dirs', default=None,
-            help="Mount /dev and /proc inside the chroot")
+        '--bind-magic-dirs', action='store_true',
+        dest='bind_magic_dirs', default=None,
+        help="Mount /dev and /proc inside the chroot")
     parser_setup.add_argument(
-            '--dont-bind-magic-dirs', action='store_false',
-            dest='bind_magic_dirs', default=None,
-            help="Don't mount /dev and /proc inside the chroot")
+        '--dont-bind-magic-dirs', action='store_false',
+        dest='bind_magic_dirs', default=None,
+        help="Don't mount /dev and /proc inside the chroot")
     parser_setup.set_defaults(func=chroot_setup)
 
     # upload
-    parser_upload = subparsers.add_parser('upload',
-                                          parents=[options, opt_owner])
+    parser_upload = subparsers.add_parser('upload')
+    add_opt_general(parser_upload)
+    add_opt_owner(parser_upload)
     parser_upload.add_argument('file', nargs=argparse.ZERO_OR_MORE,
                                help="<path>:<input_file_name>")
     parser_upload.set_defaults(func=upload, type='chroot')
 
     # run
-    parser_run = subparsers.add_parser('run', parents=[options])
-    parser_run.add_argument('run', default=None, nargs='?')
+    parser_run = subparsers.add_parser('run')
+    add_opt_general(parser_run)
+    parser_run.add_argument('run', default=None, nargs=argparse.OPTIONAL)
     parser_run.add_argument('--cmdline', nargs=argparse.REMAINDER,
                             help="Command line to run")
+    parser_run.add_argument('--enable-x11', action='store_true', default=False,
+                            dest='x11',
+                            help="Enable X11 support (needs an X server on "
+                                 "the host)")
+    parser_run.add_argument('--x11-display', dest='x11_display',
+                            help="Display number to use on the experiment "
+                                 "side (change the host display with the "
+                                 "DISPLAY environment variable)")
+    add_environment_options(parser_run)
     parser_run.set_defaults(func=chroot_run)
 
     # download
-    parser_download = subparsers.add_parser('download',
-                                            parents=[options])
+    parser_download = subparsers.add_parser('download')
+    add_opt_general(parser_download)
     parser_download.add_argument('file', nargs=argparse.ZERO_OR_MORE,
-                                 help="<output_file_name>:<path>")
+                                 help="<output_file_name>[:<path>]")
+    parser_download.add_argument('--all', action='store_true',
+                                 help="Download all output files to the "
+                                      "current directory")
     parser_download.set_defaults(func=download, type='chroot')
 
     # destroy/unmount
-    parser_destroy_unmount = subparsers.add_parser('destroy/unmount',
-                                                   parents=[options])
+    parser_destroy_unmount = subparsers.add_parser('destroy/unmount')
+    add_opt_general(parser_destroy_unmount)
     parser_destroy_unmount.set_defaults(func=chroot_destroy_unmount)
 
     # destroy/dir
-    parser_destroy_dir = subparsers.add_parser('destroy/dir',
-                                               parents=[options])
+    parser_destroy_dir = subparsers.add_parser('destroy/dir')
+    add_opt_general(parser_destroy_dir)
     parser_destroy_dir.set_defaults(func=chroot_destroy_dir)
 
     # destroy
-    parser_destroy = subparsers.add_parser('destroy', parents=[options])
+    parser_destroy = subparsers.add_parser('destroy')
+    add_opt_general(parser_destroy)
     parser_destroy.set_defaults(func=chroot_destroy)
 
     return {'test_compatibility': test_linux_same_arch}

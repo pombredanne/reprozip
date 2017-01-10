@@ -1,32 +1,27 @@
+sudo: required
+dist: trusty
+services:
+  - docker
 language: python
 env:
   - TEST_MODE=run_program
 python:
-  - "2.6"
   - "2.7"
-  - "3.2"
   - "3.3"
   - "3.4"
+  - "3.5"
 install: .travis/install.sh
 script: .travis/test.sh
 after_success: .travis/finish.sh
-notifications:
-  email:
-    recipients:
-       - reprozip.gate@gmail.com
-    on_success: change
-    on_failure: always
 matrix:
   include:
-    - python: "2.7"
-      env: TEST_MODE=check_style
-    - python: "2.7"
-      env: TEST_MODE=check_shared
-    - python: "2.7"
-      env: TEST_MODE=coverage_py
-    - python: "2.7"
-      env: TEST_MODE=coverage_c
+    - dist: trusty
+      python: "2.7"
+      env: TEST_MODE=checks
+    - dist: trusty
+      python: "2.7"
+      env: TEST_MODE=coverage
   exclude:
-    # This is already covered by coverage_py and coverage_c
+    # This is already tested by coverage
     - python: "2.7"
       env: TEST_MODE=run_program

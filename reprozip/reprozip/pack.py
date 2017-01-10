@@ -1,4 +1,4 @@
-# Copyright (C) 2014 New York University
+# Copyright (C) 2014-2016 New York University
 # This file is part of ReproZip which is released under the Revised BSD License
 # See file LICENSE for full license details.
 
@@ -9,12 +9,13 @@ utilities that are used to build the .rpz pack file from the trace SQLite file
 and config YAML.
 """
 
-from __future__ import unicode_literals
+from __future__ import division, print_function, unicode_literals
 
 import itertools
 import logging
 import os
 from rpaths import Path
+import string
 import sys
 import tarfile
 import uuid
@@ -23,7 +24,8 @@ from reprozip import __version__ as reprozip_version
 from reprozip.common import File, load_config, save_config, \
     record_usage_package
 from reprozip.tracer.linux_pkgs import identify_packages
-from reprozip.tracer.trace import merge_files
+from reprozip.traceutils import combine_files
+from reprozip.utils import iteritems
 
 
 def expand_patterns(patterns):
@@ -54,7 +56,7 @@ def expand_patterns(patterns):
     return [File(p) for p in itertools.chain(dirs - non_empty_dirs, files)]
 
 
-def canonicalize_config(runs, packages, other_files, additional_patterns,
+def canonicalize_config(packages, other_files, additional_patterns,
                         sort_packages):
     """Expands ``additional_patterns`` from the configuration file.
     """
@@ -63,9 +65,9 @@ def canonicalize_config(runs, packages, other_files, additional_patterns,
         add_files, add_packages = identify_packages(add_files)
     else:
         add_packages = []
-    other_files, packages = merge_files(add_files, add_packages,
-                                        other_files, packages)
-    return runs, packages, other_files
+    other_files, packages = combine_files(add_files, add_packages,
+                                          other_files, packages)
+    return packages, other_files
 
 
 def data_path(filename, prefix=Path('DATA')):
@@ -90,12 +92,6 @@ class PackBuilder(object):
     def __init__(self, filename):
         self.tar = tarfile.open(str(filename), 'w:gz')
         self.seen = set()
-
-    def add(self, name, arcname, *args, **kwargs):
-        from rpaths import PosixPath
-        assert isinstance(name, PosixPath)
-        assert isinstance(arcname, PosixPath)
-        self.tar.add(str(name), str(arcname), *args, **kwargs)
 
     def add_data(self, filename):
         if filename in self.seen:
@@ -130,48 +126,65 @@ def pack(target, directory, sort_packages):
                          "If not, you might want to use --dir to specify an "
                          "alternate location.")
         sys.exit(1)
-    runs, packages, other_files, additional_patterns = load_config(
-            configfile,
-            canonical=False)
+    runs, packages, other_files = config = load_config(
+        configfile,
+        canonical=False)
+    additional_patterns = config.additional_patterns
+    inputs_outputs = config.inputs_outputs
+
+    # Validate run ids
+    run_chars = ('0123456789_-@() .:%'
+                 'abcdefghijklmnopqrstuvwxyz'
+                 'ABCDEFGHIJKLMNOPQRSTUVWXYZ')
+    for i, run in enumerate(runs):
+        if (any(c not in run_chars for c in run['id']) or
+                all(c in string.digits for c in run['id'])):
+            logging.critical("Illegal run id: %r (run number %d)",
+                             run['id'], i)
+            sys.exit(1)
 
     # Canonicalize config (re-sort, expand 'additional_files' patterns)
-    runs, packages, other_files = canonicalize_config(
-            runs, packages, other_files, additional_patterns, sort_packages)
+    packages, other_files = canonicalize_config(
+        packages, other_files, additional_patterns, sort_packages)
 
     logging.info("Creating pack %s...", target)
-    tar = PackBuilder(target)
+    tar = tarfile.open(str(target), 'w:')
 
-    # Stores the original trace
-    trace = directory / 'trace.sqlite3'
-    if trace.is_file():
-        tar.add(trace, Path('METADATA/trace.sqlite3'))
+    fd, tmp = Path.tempfile()
+    os.close(fd)
+    try:
+        datatar = PackBuilder(tmp)
+        # Add the files from the packages
+        for pkg in packages:
+            if pkg.packfiles:
+                logging.info("Adding files from package %s...", pkg.name)
+                files = []
+                for f in pkg.files:
+                    if not Path(f.path).exists():
+                        logging.warning("Missing file %s from package %s",
+                                        f.path, pkg.name)
+                    else:
+                        datatar.add_data(f.path)
+                        files.append(f)
+                pkg.files = files
+            else:
+                logging.info("NOT adding files from package %s", pkg.name)
 
-    # Add the files from the packages
-    for pkg in packages:
-        if pkg.packfiles:
-            logging.info("Adding files from package %s...", pkg.name)
-            files = []
-            for f in pkg.files:
-                if not Path(f.path).exists():
-                    logging.warning("Missing file %s from package %s",
-                                    f.path, pkg.name)
-                else:
-                    tar.add_data(f.path)
-                    files.append(f)
-            pkg.files = files
-        else:
-            logging.info("NOT adding files from package %s", pkg.name)
+        # Add the rest of the files
+        logging.info("Adding other files...")
+        files = set()
+        for f in other_files:
+            if not Path(f.path).exists():
+                logging.warning("Missing file %s", f.path)
+            else:
+                datatar.add_data(f.path)
+                files.add(f)
+        other_files = files
+        datatar.close()
 
-    # Add the rest of the files
-    logging.info("Adding other files...")
-    files = set()
-    for f in other_files:
-        if not Path(f.path).exists():
-            logging.warning("Missing file %s", f.path)
-        else:
-            tar.add_data(f.path)
-            files.add(f)
-    other_files = files
+        tar.add(str(tmp), 'DATA.tar.gz')
+    finally:
+        tmp.remove()
 
     logging.info("Adding metadata...")
     # Stores pack version
@@ -179,10 +192,23 @@ def pack(target, directory, sort_packages):
     os.close(fd)
     try:
         with manifest.open('wb') as fp:
-            fp.write(b'REPROZIP VERSION 1\n')
-        tar.add(manifest, Path('METADATA/version'))
+            fp.write(b'REPROZIP VERSION 2\n')
+        tar.add(str(manifest), 'METADATA/version')
     finally:
         manifest.remove()
+
+    # Stores the original trace
+    trace = directory / 'trace.sqlite3'
+    if not trace.is_file():
+        logging.critical("trace.sqlite3 is gone! Aborting")
+        sys.exit(1)
+    tar.add(str(trace), 'METADATA/trace.sqlite3')
+
+    # Checks that input files are packed
+    for name, f in iteritems(inputs_outputs):
+        if f.read_runs and not Path(f.path).exists():
+            logging.warning("File is designated as input (name %s) but is not "
+                            "to be packed: %s", name, f.path)
 
     # Generates a unique identifier for the pack (for usage reports purposes)
     pack_id = str(uuid.uuid4())
@@ -192,14 +218,17 @@ def pack(target, directory, sort_packages):
     os.close(fd)
     try:
         save_config(can_configfile, runs, packages, other_files,
-                    reprozip_version, canonical=True,
+                    reprozip_version,
+                    inputs_outputs, canonical=True,
                     pack_id=pack_id)
 
-        tar.add(can_configfile, Path('METADATA/config.yml'))
+        tar.add(str(can_configfile), 'METADATA/config.yml')
     finally:
         can_configfile.remove()
 
     tar.close()
 
     # Record some info to the usage report
-    record_usage_package(runs, packages, other_files, pack_id)
+    record_usage_package(runs, packages, other_files,
+                         inputs_outputs,
+                         pack_id)

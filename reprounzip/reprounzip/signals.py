@@ -1,4 +1,4 @@
-# Copyright (C) 2014 New York University
+# Copyright (C) 2014-2016 New York University
 # This file is part of ReproZip which is released under the Revised BSD License
 # See file LICENSE for full license details.
 
@@ -8,7 +8,7 @@ Emitting and subscribing to these signals is the framework for the plugin
 infrastructure.
 """
 
-from __future__ import unicode_literals
+from __future__ import division, print_function, unicode_literals
 
 import traceback
 import warnings
@@ -71,15 +71,15 @@ class Signal(object):
                     info[arg] = kwargs.pop(arg)
                     if argtype == Signal.DEPRECATED:
                         warnings.warn(
-                                "signal: Argument %s is deprecated" % arg,
-                                category=SignalWarning,
-                                stacklevel=2)
+                            "signal: Argument %s is deprecated" % arg,
+                            category=SignalWarning,
+                            stacklevel=2)
         if kwargs:
             arg = next(iter(kwargs))
             warnings.warn(
-                    "signal: Unexpected argument %s; signal ignored" % arg,
-                    category=SignalWarning,
-                    stacklevel=2)
+                "signal: Unexpected argument %s; signal ignored" % arg,
+                category=SignalWarning,
+                stacklevel=2)
             return
 
         for listener in self._listeners:
@@ -113,7 +113,7 @@ class Signal(object):
 
 
 pre_setup = Signal(['target', 'pack'])
-post_setup = Signal(['target'])
+post_setup = Signal(['target'], ['pack'])
 pre_destroy = Signal(['target'])
 post_destroy = Signal(['target'])
 pre_run = Signal(['target'])

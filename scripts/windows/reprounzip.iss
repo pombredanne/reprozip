@@ -1,10 +1,15 @@
 ; This needs:
 ;   Default installation of Python 2.7 in C:\Python2.7
+;   python27.dll in C:\Python2.7 (might be in Windows\system[32])
+;     make sure python27.dll is 32bit
 ;   PyCrypto installed in Python installation
+;   ssh.exe and DLLs in input\ssh
+;   make sure to generate reprounzip.exe with setuptools (not distutils),
+;     change shebang to #!python.exe
 
 [Setup]
 AppName=ReproUnzip
-AppVerName=ReproUnzip 0.5.1
+AppVerName=ReproUnzip 1.1.0
 OutputBaseFilename=reprounzip-setup
 DefaultGroupName=ReproZip
 DefaultDirName={pf}\ReproUnzip

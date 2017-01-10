@@ -1,16 +1,16 @@
+# Copyright (C) 2014-2016 New York University
+# This file is part of ReproZip which is released under the Revised BSD License
+# See file LICENSE for full license details.
+
+from __future__ import unicode_literals
+
 import argparse
-import codecs
 import locale
 import logging
 import os
 import sys
+import unittest
 import warnings
-
-try:
-    import unittest2 as unittest
-    sys.modules['unittest'] = unittest
-except ImportError:
-    import unittest
 
 
 top_level = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -22,18 +22,18 @@ if top_level not in sys.path:
 sys.path.append(start_dir)
 
 
-from reprounzip.common import setup_logging
-from reprounzip.signals import SignalWarning
+from reprounzip.common import setup_logging     # noqa
+from reprounzip.signals import SignalWarning    # noqa
 
-from tests.functional import functional_tests
+from tests.functional import functional_tests   # noqa
 
 
 class Program(unittest.TestProgram):
     def createTests(self):
         if self.testNames is None:
             self.test = self.testLoader.discover(
-                    start_dir=os.path.dirname(os.path.abspath(__file__)),
-                    pattern='test_*.py')
+                start_dir=os.path.dirname(os.path.abspath(__file__)),
+                pattern='test_*.py')
         else:
             self.test = self.testLoader.loadTestsFromNames(self.testNames)
 
@@ -41,15 +41,6 @@ class Program(unittest.TestProgram):
 if __name__ == '__main__':
     # Locale
     locale.setlocale(locale.LC_ALL, '')
-
-    # Encoding for output streams
-    if str == bytes:  # PY2
-        writer = codecs.getwriter(locale.getpreferredencoding())
-        o_stdout, o_stderr = sys.stdout, sys.stderr
-        sys.stdout = writer(sys.stdout)
-        sys.stdout.buffer = o_stdout
-        sys.stderr = writer(sys.stderr)
-        sys.stderr.buffer = o_stderr
 
     # Disables usage reporting
     os.environ['REPROZIP_USAGE_STATS'] = 'off'
@@ -86,11 +77,6 @@ if __name__ == '__main__':
     successful = True
     if unittests:
         logging.info("Running unit tests")
-        if not hasattr(unittest, 'skipIf'):
-            logging.info("This testsuite will not work with pre-2.7 "
-                         "unittest. If running Python 2.6, you'll need to "
-                         "install the 'unittest2' package.")
-            sys.exit(1)
         prog = Program(argv=['tests'] + args.arg, exit=False)
         successful = prog.result.wasSuccessful()
     if functests:
